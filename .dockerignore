@@ -1,0 +1,84 @@
+# === 版本控制和编辑器垃圾 ===
+.git
+.gitignore
+.gitattributes
+.github
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# === Python 缓存和字节码 ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# === 虚拟环境和依赖缓存 ===
+.venv/
+venv/
+env/
+.venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# === 大型数据/模型/输出 ===
+dataset/
+model/
+outputs/
+experiments/
+checkpoints/
+logs/
+tensorboard/
+wandb/
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.gguf
+*.onnx
+
+# === 敏感/配置/秘密文件 ===
+.env
+.env.*
+*.key
+*.pem
+*.crt
+*.cert
+*.password
+config.yaml.secret
+secrets/
+
+# === 测试/临时文件 ===
+tests/__pycache__/
+tmp/
+temp/
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# === 构建/打包产物 ===
+build/
+dist/
+*.egg-info/
+*.whl
+*.tar.gz
+*.zip
+
+# === 其他常见垃圾 ===
+npm-debug.log
+yarn-error.log
+yarn-debug.log
+.DS_Store
+.AppleDouble
+.LSOverride

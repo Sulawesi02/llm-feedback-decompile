@@ -1,0 +1,99 @@
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    margin: 0;
+    padding: 0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background-color: #f4f4f9;
+}
+header {
+    background-color: #333;
+    color: white;
+    padding: 1rem;
+    text-align: center;
+}
+.container {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+}
+.panel {
+    flex: 1;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+}
+.left-panel {
+    border-right: 2px solid #ddd;
+    background-color: #fff;
+}
+.right-panel {
+    background-color: #fcfcfc;
+}
+h2 {
+    margin-top: 0;
+    color: #444;
+    border-bottom: 2px solid #eee;
+    padding-bottom: 10px;
+}
+.form-group {
+    margin-bottom: 15px;
+}
+label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: bold;
+    color: #555;
+}
+select, textarea, button {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-family: monospace;
+    box-sizing: border-box; /* Fix padding issue */
+}
+textarea {
+    resize: vertical;
+    min-height: 200px;
+    font-size: 14px;
+}
+button {
+    background-color: #28a745;
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-size: 16px;
+    margin-top: 10px;
+    transition: background-color 0.3s;
+}
+button:hover {
+    background-color: #218838;
+}
+button:disabled {
+    background-color: #94d3a2;
+    cursor: not-allowed;
+}
+#output-code {
+    flex: 1;
+    background-color: #2d2d2d;
+    color: #f8f8f2;
+    padding: 15px;
+    border-radius: 4px;
+    overflow: auto;
+    white-space: pre-wrap;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    font-size: 14px;
+}
+.loading {
+    text-align: center;
+    color: #666;
+    margin-top: 10px;
+    display: none;
+}
+.error {
+    color: #dc3545;
+    margin-top: 10px;
+}

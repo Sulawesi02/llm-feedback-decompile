@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Decompiler Feedback Loop</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+    <h1>LLM Decompiler Web Interface</h1>
+</header>
+
+<div class="container">
+    <div class="panel left-panel">
+        <h2>Input Configuration</h2>
+        
+        <div class="form-group">
+            <label for="arch">Architecture</label>
+            <select id="arch">
+                <option value="x86">x86_64</option>
+                <option value="arm">ARM (aarch64)</option>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label for="opt">Optimization Level</label>
+            <select id="opt">
+                <option value="O1">O1</option>
+                <option value="O2">O2</option>
+                <option value="O3">O3</option>
+                <option value="O4">O4</option>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label for="machine-code">Machine Code (Hex String)</label>
+            <textarea id="machine-code" placeholder="e.g., 55 48 89 e5 89 7d fc 8b 45 fc 0f af c0 5d c3"></textarea>
+            <small style="color: #666;">Enter hex bytes separated by spaces or newlines.</small>
+        </div>
+
+        <button id="decompile-btn" onclick="decompile()">Decompile</button>
+        <div id="status-msg" class="loading">Processing...</div>
+    </div>
+
+    <div class="panel right-panel">
+        <h2>Decompiled C Code</h2>
+        <div id="output-code">// Result will appear here...</div>
+    </div>
+</div>
+
+<script src="script.js"></script>
+
+</body>
+</html>
