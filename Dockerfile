@@ -4,6 +4,10 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
 
+# 替换 apt 源为清华源
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com/ubuntu/|http://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list
+
 # 系统工具 + 交叉编译 + ninja + capstone
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget ca-certificates unzip git curl bzip2 build-essential vim \

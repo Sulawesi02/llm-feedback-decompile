@@ -19,17 +19,24 @@ docker build -t llm-feedback-decompile-env .
 
 ### 2. 启动环境
 ```bash
-docker run --gpus all -it -v ${PWD}:/app llm-feedback-decompile-env
+docker run --gpus all -it -p 8000:8000 -p 8001:8001 -v ${PWD}:/app llm-feedback-decompile-env
 ```
 
 ### 3. 启动服务
-进入容器后，启动后端服务：
+进入容器后，需要分别启动模型服务和 Web 服务：
+
+#### 3.1 启动模型服务 (端口 8001，负责加载模型和推理)
 ```bash
 cd src
-# 启动 FastAPI 后端服务
-python app.py
+python model_server.py
 ```
 
+#### 3.2 启动 Web 服务 (端口 8000，负责业务逻辑和前端)
+```bash
+docker exec -it <同一个CONTAINER ID> /bin/bash
+cd src
+python app.py
+```
 ### 4. 访问界面
 服务启动成功后，请在浏览器中访问：
 http://localhost:8000

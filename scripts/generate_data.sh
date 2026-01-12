@@ -3,7 +3,7 @@
 
 echo "=== ExeBench数据集解压脚本 ==="
 
-BASE_DIR="/app/dataset/exebench1"
+BASE_DIR="/app/data/exebench"
 cd $BASE_DIR
 
 # 1. 创建目录

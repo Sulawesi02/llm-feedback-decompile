@@ -6,11 +6,18 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import multiprocessing as mp
+import sys
 
-base_dir = Path("/app/dataset/exebench")
+# 添加项目根目录到 sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from src.config import DATA_DIR, PROCESSED_DATA_DIR
+
+base_dir = DATA_DIR
+output_dir = PROCESSED_DATA_DIR
+output_dir.mkdir(parents=True, exist_ok=True)
 
 # SPLITS = ["train", "valid", "test"]
-SPLITS = ["valid", "test"]
+SPLITS = ["train"]
 
 TARGETS = [
     ("x86", "O0"), ("x86", "O1"), ("x86", "O2"), ("x86", "O3"), 
@@ -111,10 +118,14 @@ def main():
     for split in SPLITS:
         split_dir = base_dir / split
         jsonl_files = list(split_dir.glob("*.jsonl"))
+        # 仅处理 train 数据集的前 6 个文件
+        if split == "train":
+            jsonl_files = jsonl_files[:6]
         total_files = len(jsonl_files)
         print(f"\n处理 {split} 数据集，共 {total_files} 个文件")
-
-        out_path = split_dir / f"{split}_machine_to_c.jsonl"
+        
+        # 使用配置中的 processed 目录
+        out_path = output_dir / f"{split}_machine_to_c.jsonl"
 
         # 收集所有待处理的 (line, c_code)
         tasks = []
