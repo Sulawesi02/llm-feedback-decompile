@@ -8,22 +8,18 @@ from pathlib import Path
 
 # 添加项目根目录到 sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from src.config import BASE_MODEL_NAME, BASE_MODEL_PATH, LORA_CHECKPOINTS_DIR, MERGED_MODEL_DIR, TRAIN_DATA_PATH, VALID_DATA_PATH
-
+from src.config import BASE_MODEL_NAME, BASE_MODEL_DIR_PATH, LORA_CHECKPOINTS_DIR_PATH, MERGED_MODEL_DIR_PATH, TRAIN_DATA_FILE_PATH, VALID_DATA_FILE_PATH
+from src.utils import load_model_utils, load_jsonl
 # 设置 HF 镜像源
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TrainingArguments, Trainer, DataCollatorForSeq2Seq
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftModel, TaskType
-from datasets import load_dataset
+from datasets import Dataset, DatasetDict
 
-DATA_FILES = {
-    "train": str(TRAIN_DATA_PATH),
-    "valid": str(VALID_DATA_PATH)
-}
-
-def download_model_with_retry(repo_id, local_dir, max_retries=10):
+def download_base_model(repo_id, local_dir, max_retries=10):
+    """ 下载基座模型 """
     for i in range(max_retries):
         try:
             print(f"[{i+1}/{max_retries}] 正在下载模型: {repo_id}")
@@ -45,84 +41,87 @@ def download_model_with_retry(repo_id, local_dir, max_retries=10):
                 raise RuntimeError(f"模型下载失败，已重试 {max_retries} 次") from e
 
 def format_and_tokenize(examples, tokenizer, max_length=256):
-    """
-    将数据集格式化为模型输入并进行 Tokenization
-    """
+    """ 格式化并 tokenize 输入样本 """
     inputs = []
     targets = []
     
-    for arch, opt, machine_code, c_code in zip(
-        examples['arch'], examples['opt'], examples['machine_code'], examples['c_code']
-    ):
-        # 构建 Prompt
-        prompt = f"""你是一个专业的二进制反编译专家。
-请把下面这段 {arch} {opt} 机器码反编译成可读的 C 语言函数：
-
-{machine_code}
-
-输出只包含 C 代码，不要解释，不要添加额外文字。
-
-C 代码：
-"""
-        # 输入部分 = Prompt + Answer + EOS
-        full_text = prompt + c_code + tokenizer.eos_token
-        
-        # Tokenize
-        tokenized = tokenizer(
-            full_text,
-            truncation=True,
-            max_length=max_length,
-            padding=False,
-            return_tensors=None
-        )
-        
-        inputs.append(tokenized["input_ids"])
-        targets.append(tokenized["input_ids"])
+    if "asm" in examples and isinstance(examples["asm"][0], dict):
+        for c_code, asm_data in zip(examples["c_code"], examples["asm"]):
+            if not isinstance(asm_data, dict):
+                continue
+            for arch, arch_data in asm_data.items():
+                if not isinstance(arch_data, dict):
+                    continue
+                for opt, opt_data in arch_data.items():
+                    if not isinstance(opt_data, dict):
+                        continue
+                    asm_text = opt_data.get("asm")
+                    if not asm_text:
+                        continue
+                    
+                    prompt = (
+                        f"架构: {arch}\n"
+                        f"优化级别: {opt}\n\n"
+                        "请将以下汇编代码反编译成等效的 C 函数，要求：\n"
+                        "1. 严格保持语义正确；\n"
+                        "2. 尽量使用清晰易读的 C 语言写法（如数组下标和规范的控制流结构）；\n"
+                        "3. 只输出一个完整的 C 函数定义，不要包含任何解释性文字或 Markdown 代码块标记。\n\n"
+                        f"{asm_text}\n\n"
+                    )
+                    text = prompt + (c_code or "")
+                    tokenized = tokenizer(
+                        text,
+                        truncation=True,
+                        max_length=max_length,
+                        padding=False,
+                        return_tensors=None,
+                    )
+                    inputs.append(tokenized["input_ids"])
+                    targets.append(tokenized["input_ids"])
+    else:
+        for arch, opt, asm_text, c_code in zip(
+            examples["arch"], examples["opt"], examples["asm"], examples["c_code"]
+        ):
+            prompt = f"架构: {arch}\n优化级别: {opt}\n\n请将以下汇编代码反编译为等效的 C 函数，只输出 C 代码本身，不要解释。\n\n{asm_text}\n\n"
+            text = prompt + c_code
+            tokenized = tokenizer(
+                text,
+                truncation=True,
+                max_length=max_length,
+                padding=False,
+                return_tensors=None,
+            )
+            inputs.append(tokenized["input_ids"])
+            targets.append(tokenized["input_ids"])
 
     return {
         "input_ids": inputs,
-        "attention_mask": [ [1]*len(x) for x in inputs ],
-        "labels": targets
+        "attention_mask": [[1] * len(x) for x in inputs],
+        "labels": targets,
     }
 
-def train_version(version_name, data_ratio):
-    print(f"\n{'='*20} 开始训练版本: {version_name} (数据比例: {data_ratio}) {'='*20}")
+def train(version, ratio):
+    print(f"\n{'='*20} 开始训练版本: {version} (数据比例: {ratio}) {'='*20}")
     
-    # 转换为 str 避免 path 对象拼接问题（如果库不支持）
-    lora_version_dir = str(LORA_CHECKPOINTS_DIR / version_name)
-    merged_model_version_dir = str(MERGED_MODEL_DIR / version_name)
-    base_model_path_str = str(BASE_MODEL_PATH)
+    LORA_CHECKPOINTS_VERSION_DIR_PATH = LORA_CHECKPOINTS_DIR_PATH / version
+    MERGED_MODEL_VERSION_DIR_PATH = MERGED_MODEL_DIR_PATH / version
     
-    os.makedirs(lora_version_dir, exist_ok=True)
-    os.makedirs(merged_model_version_dir, exist_ok=True)
+    LORA_CHECKPOINTS_VERSION_DIR_PATH.mkdir(parents=True, exist_ok=True)
+    MERGED_MODEL_VERSION_DIR_PATH.mkdir(parents=True, exist_ok=True)
     
     # 检查已生成的模型是否完整
-    lora_exists = len(os.listdir(lora_version_dir)) > 0
-    merged_exists = len(os.listdir(merged_model_version_dir)) > 0
+    lora_exists = len(os.listdir(LORA_CHECKPOINTS_VERSION_DIR_PATH)) > 0
+    merged_exists = len(os.listdir(MERGED_MODEL_VERSION_DIR_PATH)) > 0
 
+    if lora_exists and merged_exists:
+        print(f"版本 {version} 的 LoRA 和合并模型均已存在且完整，跳过训练。")
+        return
+    
     if not lora_exists:
-        print(f"版本 {version_name} 的 LoRA 不存在，开始训练...")
+        print(f"{version} 版本的 LoRA 不存在，开始训练...")
         
-        print("定义量化配置...")
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-
-        print(f"加载 Tokenizer: {base_model_path_str}")
-        tokenizer = AutoTokenizer.from_pretrained(base_model_path_str, trust_remote_code=True)
-
-        print(f"加载模型: {base_model_path_str}")
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model_path_str,
-            quantization_config=quant_config,
-            device_map={"": 0}, 
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            attn_implementation="flash_attention_2", 
-        )
+        # 加载量化模型和分词器
+        model, tokenizer = load_model_utils(str(BASE_MODEL_DIR_PATH))
 
         # 准备模型用于 k-bit 训练
         model = prepare_model_for_kbit_training(model)
@@ -142,15 +141,29 @@ def train_version(version_name, data_ratio):
 
         print("加载数据...")
         try:
-            data = load_dataset("json", data_files=DATA_FILES)
-            full_train = data["train"].shuffle(seed=42).select(range(1000))
-            target_size = int(1000 * data_ratio)
-            data["train"] = full_train.select(range(target_size))
+            train_raw = load_jsonl(TRAIN_DATA_FILE_PATH)
+            valid_raw = load_jsonl(VALID_DATA_FILE_PATH)
             
-            if "valid" in data:
-                data["valid"] = data["valid"].shuffle(seed=42).select(range(200))
+            print(f"原始训练数据: {len(train_raw)} 条, 验证数据: {len(valid_raw)} 条")
             
-            print(f"当前训练集大小: {len(data['train'])} (Target: {target_size})")
+            train_ds = Dataset.from_list(train_raw).shuffle(seed=42)
+            valid_ds = Dataset.from_list(valid_raw).shuffle(seed=42)
+            
+            train_target_size = max(1, int(len(train_ds) * ratio))
+            valid_target_size = max(1, int(len(valid_ds) * ratio)) if len(valid_ds) > 0 else 0
+            
+            final_train = train_ds.select(range(train_target_size))
+            final_valid = valid_ds.select(range(valid_target_size)) if valid_target_size > 0 else valid_ds
+            
+            data = DatasetDict({
+                "train": final_train,
+                "valid": final_valid
+            })
+            
+            print(
+                f"当前训练集大小: {len(data['train'])} (Target: {train_target_size}), "
+                f"验证集大小: {len(data['valid'])} (Target: {valid_target_size})"
+            )
 
             print("处理数据 (Tokenization)...")
             remove_columns = data["train"].column_names
@@ -164,7 +177,7 @@ def train_version(version_name, data_ratio):
             return
 
         training_args = TrainingArguments(
-            output_dir=lora_version_dir,
+            output_dir=LORA_CHECKPOINTS_VERSION_DIR_PATH,
             per_device_train_batch_size=1,
             gradient_accumulation_steps=8,
             learning_rate=3e-4,
@@ -195,87 +208,79 @@ def train_version(version_name, data_ratio):
             data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True),
         )
 
-        print(f"开始训练版本 {version_name}...")
+        print(f"开始训练版本 {version}...")
         trainer.train()
 
-        print(f"保存 LoRA 适配器到 {lora_version_dir}")
-        model.save_pretrained(lora_version_dir)
-        tokenizer.save_pretrained(lora_version_dir)
+        print(f"保存 LoRA 适配器到 {LORA_CHECKPOINTS_VERSION_DIR_PATH}")
+        model.save_pretrained(LORA_CHECKPOINTS_VERSION_DIR_PATH)
+        tokenizer.save_pretrained(LORA_CHECKPOINTS_VERSION_DIR_PATH)
         
         # 清理训练资源
         del model, trainer
         torch.cuda.empty_cache()
         gc.collect()
     
-    # 2. 如果 Merged 模型不存在，则进行合并
+    # 如果 Merged 模型不存在，则进行合并
     if not merged_exists:
-        print(f"版本 {version_name} 的 LoRA 已准备就绪，开始合并模型...")
-
-        print(f"开始合并模型并保存到 {merged_model_version_dir} ...")
+        print(f"{version} 版本的合并模型不存在，开始合并...")
         
-        tokenizer = AutoTokenizer.from_pretrained(base_model_path_str, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR_PATH, trust_remote_code=True)
 
         # 重新加载基座模型
         base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_path_str,
-            torch_dtype=torch.bfloat16,
+            BASE_MODEL_DIR_PATH,
             device_map="cpu",
+            torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             trust_remote_code=True
         )
         
         # 加载 LoRA
-        model_to_merge = PeftModel.from_pretrained(base_model, lora_version_dir)
+        model_to_merge = PeftModel.from_pretrained(base_model, LORA_CHECKPOINTS_VERSION_DIR_PATH)
         
         # 合并
         merged_model = model_to_merge.merge_and_unload()
         
         # 保存
-        merged_model.save_pretrained(merged_model_version_dir)
-        tokenizer.save_pretrained(merged_model_version_dir)
+        merged_model.save_pretrained(MERGED_MODEL_VERSION_DIR_PATH)
+        tokenizer.save_pretrained(MERGED_MODEL_VERSION_DIR_PATH)
         
-        print(f"版本 {version_name} 合并完成！")
+        print(f"版本 {version} 合并完成！")
         
         # 清理合并后的模型
         del base_model, model_to_merge, merged_model
         torch.cuda.empty_cache()
         gc.collect()
     
-    elif lora_exists and merged_exists:
-        print(f"版本 {version_name} 的 LoRA 和合并模型均已存在且完整，跳过训练。")
-        return
-    
 def main():
-    # 确保目录存在
-    BASE_MODEL_PATH.mkdir(parents=True, exist_ok=True)
-    LORA_CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
-    MERGED_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    BASE_MODEL_DIR_PATH.mkdir(parents=True, exist_ok=True)
+    LORA_CHECKPOINTS_DIR_PATH.mkdir(parents=True, exist_ok=True)
+    MERGED_MODEL_DIR_PATH.mkdir(parents=True, exist_ok=True)
     
-    base_exists = len(os.listdir(BASE_MODEL_PATH)) > 0
+    base_exists = len(os.listdir(BASE_MODEL_DIR_PATH)) > 0
     
-    print("开始准备基座模型...")
     if base_exists:
-        print(f"模型已存在: {BASE_MODEL_PATH}")
+        print(f"基座模型已存在: {BASE_MODEL_DIR_PATH}")
     else:
-        print(f"模型不存在, 开始下载模型...")
+        print(f"基座模型不存在, 开始下载...")
         try:
-            download_model_with_retry(BASE_MODEL_NAME, BASE_MODEL_PATH)
+            download_base_model(BASE_MODEL_NAME, BASE_MODEL_DIR_PATH)
         except Exception as e:
             print(f"下载模型失败: {e}")
             return
 
     versions = [
-        ("v1", 0.10),
-        ("v2", 0.25),
-        # ("v3", 0.50),
+        ("v1", 0.01),
+        ("v2", 0.05),
+        ("v3", 0.1),
         # ("v4", 1.00)
     ]
     
-    for ver, ratio in versions:
+    for version, ratio in versions:
         try:
-            train_version(ver, ratio)
+            train(version, ratio)
         except Exception as e:
-            print(f"训练版本 {ver} 失败: {e}")
+            print(f"训练版本 {version} 失败: {e}")
             break
 
     print("\n训练结束！")

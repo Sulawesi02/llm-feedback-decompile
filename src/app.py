@@ -6,9 +6,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Union
 
-from utils import construct_initial_prompt, construct_refine_prompt, clean_c_code, compile_c_code
+from utils import construct_initial_prompt, construct_refine_prompt, clean_c_code, compile
 
 app = FastAPI()
 
@@ -20,15 +20,21 @@ class DecompileRequest(BaseModel):
     opt: str # -O0 / -O1 / -O2 / -O3
     machine_code: str
 
-def generate_c_code(messages: list) -> str:
+def generate_c_code(messages: Union[str, list]) -> str:
     """ 调用模型服务生成 C 代码 """
     try:
-        print(f"调用模型服务请求: {messages}")
-        response = requests.post(MODEL_SERVER_URL, json=messages, timeout=120)
-        response.raise_for_status()
+        print(f"请求调用模型服务: {messages}")
+        response = requests.post(MODEL_SERVER_URL, json={"messages": messages})
+        response.raise_for_status() # 抛出HTTP错误
         result = response.json()
-        c_code = result.get("text", "")
+        c_code = result.get("text")
         return clean_c_code(c_code)
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 408:
+            print(f"调用模型服务超时 (HTTP 408)")
+            return "// 模型生成超时，请稍后重试"
+        print(f"调用模型服务失败 (HTTP {e.response.status_code}): {e}")
+        return ""
     except Exception as e:
         print(f"调用模型服务失败: {e}")
         return ""
@@ -39,8 +45,8 @@ async def decompile(request: DecompileRequest):
     if not request.machine_code.strip():
         raise HTTPException(status_code=400, detail="机器码不能为空")
 
-    prompt = construct_initial_prompt(request.arch, request.opt, request.machine_code)
-    c_code = generate_c_code(prompt)
+    messages = construct_initial_prompt(request.arch, request.opt, request.machine_code)
+    c_code = generate_c_code(messages)
     return {"c_code": c_code or "// 生成失败，可能是模型服务不可用"}
 
 # 循环反馈反编译
@@ -56,8 +62,8 @@ async def feedback_decompile(request: DecompileRequest, max_iters: int = 10):
     history = []
     best_c_code = None
 
-    prompt = construct_initial_prompt(arch, opt, machine_code)
-    c_code = generate_c_code(prompt)
+    messages = construct_initial_prompt(arch, opt, machine_code)
+    c_code = generate_c_code(messages)
     history.append({"iter": 0, "c_code": c_code, "status": "generated"})
 
     if not c_code:
@@ -69,7 +75,7 @@ async def feedback_decompile(request: DecompileRequest, max_iters: int = 10):
         }
 
     for it in range(max_iters):
-        compile_result = compile_c_code(c_code, arch, opt)
+        compile_result = compile(c_code, arch, opt)
         workdir = compile_result.get("workdir")
 
         if compile_result["success"]:
@@ -93,8 +99,8 @@ async def feedback_decompile(request: DecompileRequest, max_iters: int = 10):
                 "error": error_msg
             })
 
-            refine_prompt = construct_refine_prompt(c_code, error_msg)
-            c_code = generate_c_code(refine_prompt)
+            refine_messages = construct_refine_prompt(c_code, error_msg)
+            c_code = generate_c_code(refine_messages)
             if not c_code:
                  history.append({"iter": it + 1, "c_code": "", "status": "error", "message": "模型生成失败"})
                  # 清理临时目录
@@ -116,8 +122,7 @@ async def feedback_decompile(request: DecompileRequest, max_iters: int = 10):
 
 # 静态文件服务
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-if not STATIC_DIR.exists():
-    STATIC_DIR.mkdir()
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 

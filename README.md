@@ -50,15 +50,13 @@ http://localhost:8000
 ### 数据处理流程
 ```bash
 cd scripts
-# 1. 生成原始数据
+# 下载 ExeBench 原始 JSONL 数据
 ./generate_data.sh
-# 2. 预处理数据
-python preprocess.py
-# 3. 开始训练
-python train.py
 ```
 
-### ExeBench 数据集统计
+ExeBench 原始 JSONL 数据放在 `data/(train/valid/test)` 目录下。
+
+#### ExeBench 数据集统计
 | 数据集类别 | 数量 | 描述 |
 | :--- | :--- | :--- |
 | `train_not_compilable` | 2.357M | 训练集不可编译代码 |
@@ -72,7 +70,7 @@ python train.py
 | `test_synth` | 5k | 测试集合成代码 |
 | `test_real` | 2.134k | 测试集真实代码 |
 
-## 📝 数据格式说明 (JSONL)
+#### ExeBench 数据格式说明
 
 ExeBench 数据集采用 JSONL 格式存储，每条记录包含完整的函数信息、汇编代码及编译元数据。
 
@@ -106,7 +104,9 @@ ExeBench 数据集采用 JSONL 格式存储，每条记录包含完整的函数�
       },
       "real_gcc_x86_O0": {...},
       "angha_gcc_x86_Os": {...},
-      // ... 其他架构和优化级别的组合
+      "real_gcc_x86_Os": {...},
+      "angha_gcc_x86_O3": {...},
+      "real_gcc_x86_O3": {...},
     },
     
     // 编译依赖
@@ -146,3 +146,52 @@ ExeBench 数据集采用 JSONL 格式存储，每条记录包含完整的函数�
   "meta": {}
 }
 ```
+
+```bash
+# 数据预处理（编译 + 反汇编 + 去重）
+python preprocess.py
+```
+
+处理后的数据放在 `data/processed` 目录下，每个样本包含：
+- `c_code`：对应的 C 代码
+- `asm`：函数的汇编代码
+  - `x86`：x86 架构的汇编代码
+    - `O0`：未优化
+    - `O1`：优化等级 1
+    - `O2`：优化等级 2
+    - `O3`：优化等级 3
+  - `arm`：ARM 架构的汇编代码
+    - `O0`：未优化
+    - `O1`：优化等级 1
+    - `O2`：优化等级 2
+    - `O3`：优化等级 3
+
+通过计算代码的 MinHash 并利用局部敏感哈希（LSH）删除重复样本，得到去重后的 asm_to_c 数据集：
+- train : 10379 -> 9412
+- valid : 1792 -> 1614
+- test : 1872 -> 1650
+
+```bash
+# 开始训练（LoRA 微调）
+python train.py
+```
+
+按配置的 `versions` 列表从去重后的 train/valid 数据集中按比例采样子集，进行多轮 LoRA 微调，并将 LORA 保存到 `model/lora_checkpoints/<version>/`，合并后的模型保存到 `model/merged_model/<version>/`。
+
+### 模型评估
+
+模型训练并合并完成后，可以使用 `scripts/evaluate.py` 对合并后的模型版本进行自动评估：
+
+```bash
+cd scripts
+python evaluate.py
+```
+
+评估脚本会：
+- 从 `merged_model` 目录下自动扫描所有版本；
+- 使用 `data/processed/test_asm_to_c_dedup.jsonl` 中的样本作为测试集；
+- 对每个模型版本执行「反编译 -> 编译验证 -> 最多多轮反馈修复」；
+- 将每个版本的详细评估结果保存到 `eval/<version>.json`，并在终端打印各版本的编译通过率汇总。
+
+
+
