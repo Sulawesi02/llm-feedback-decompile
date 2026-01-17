@@ -4,13 +4,13 @@
 
 本系统利用**编译器反馈循环 (Compiler Feedback Loop)** 机制，自动捕获模型生成的 C 代码中的编译错误，并将其反馈给模型进行自我修正，从而显著提高反编译代码的可编译性和准确性。
 
-## 🚀 核心功能
+## 核心功能
 - **交互式反编译**：支持 x86_64 和 ARM (aarch64) 架构的机器码反编译。
 - **反馈循环机制**：系统自动验证生成的代码，如果编译失败，会将错误信息反馈给模型进行迭代修正。
 - **Web 可视化界面**：提供直观的 Web UI，用户可直接输入 Hex 格式的机器码并查看反编译结果。
 - **多种优化级别**：支持 O0, O1, O2, O3 等不同优化级别的处理。
 
-## 🛠️ 快速开始
+## 快速开始
 ### 1. 构建环境
 推荐使用 Docker 容器以确保编译器环境一致性：
 ```bash
@@ -19,21 +19,13 @@ docker build -t llm-feedback-decompile-env .
 
 ### 2. 启动环境
 ```bash
-docker run --gpus all -it -p 8000:8000 -p 8001:8001 -v ${PWD}:/app llm-feedback-decompile-env
+docker run --gpus all -it -p 8000:8000 -v ${PWD}:/app llm-feedback-decompile-env
 ```
 
 ### 3. 启动服务
-进入容器后，需要分别启动模型服务和 Web 服务：
+进入容器后，启动 Web 服务（端口 8000）：
 
-#### 3.1 启动模型服务 (端口 8001，负责加载模型和推理)
 ```bash
-cd src
-python model_server.py
-```
-
-#### 3.2 启动 Web 服务 (端口 8000，负责业务逻辑和前端)
-```bash
-docker exec -it <同一个CONTAINER ID> /bin/bash
 cd src
 python app.py
 ```
@@ -43,18 +35,22 @@ http://localhost:8000
 
 ---
 
-## 📊 数据集与训练
+## 数据集
 
 本项目模型训练主要基于 **ExeBench** 数据集。
 
-### 数据处理流程
+### 1. 下载 ExeBench 数据集
+https://huggingface.co/datasets/jordiae/exebench/tree/main
+
+### 2. 解压 ExeBench 数据集
 ```bash
 cd scripts
-# 下载 ExeBench 原始 JSONL 数据
-./generate_data.sh
+# 解压 ExeBench 数据集
+./extract_data.sh
 ```
 
-ExeBench 原始 JSONL 数据放在 `data/(train/valid/test)` 目录下。
+- 在 `data/exebench` 目录下创建 `train` 、 `valid` 、 `test` 子目录。
+- 在每个子目录下解压下载的 JSONL 文件。
 
 #### ExeBench 数据集统计
 | 数据集类别 | 数量 | 描述 |
@@ -147,51 +143,75 @@ ExeBench 数据集采用 JSONL 格式存储，每条记录包含完整的函数�
 }
 ```
 
+### 3. 数据预处理
 ```bash
-# 数据预处理（编译 + 反汇编 + 去重）
+# 数据预处理
 python preprocess.py
 ```
 
-处理后的数据放在 `data/processed` 目录下，每个样本包含：
-- `c_code`：对应的 C 代码
-- `asm`：函数的汇编代码
-  - `x86`：x86 架构的汇编代码
-    - `O0`：未优化
-    - `O1`：优化等级 1
-    - `O2`：优化等级 2
-    - `O3`：优化等级 3
-  - `arm`：ARM 架构的汇编代码
-    - `O0`：未优化
-    - `O1`：优化等级 1
-    - `O2`：优化等级 2
-    - `O3`：优化等级 3
+- 从 `data/exebench` 目录加载 JSONL 数据；
+- 提取 C 代码，编译并生成汇编代码和机器码；
+- 通过计算代码的 MinHash 并利用局部敏感哈希（LSH）删除重复样本；
+  - train : 10379 -> 9412
+  - valid : 1792 -> 1614
+  - test : 1872 -> 1650
+- 保存处理后的样本到 `data/processed` 目录。
 
-通过计算代码的 MinHash 并利用局部敏感哈希（LSH）删除重复样本，得到去重后的 asm_to_c 数据集：
-- train : 10379 -> 9412
-- valid : 1792 -> 1614
-- test : 1872 -> 1650
+#### 处理后的样本格式
+```json
+{
+  "c_code": "对应的 C 代码",
+  "compilations": {
+    "x86": {
+      "O0": {
+        "asm": "汇编代码",
+        "machine_code": "机器码"
+      },
+      "O1": {...},
+      "O2": {...},
+      "O3": {...}
+    },
+    "arm": {...}
+  }
+}
+```
+
+## 模型
+
+本项目模型主要基于 **Qwen2.5** 模型。
+
+### 1. 下载基座模型
 
 ```bash
-# 开始训练（LoRA 微调）
+# 下载基座模型
+python download_model.py
+```
+
+- 按配置的 `MODEL_NAMES` 列表（如 1.5B/3B/7B 版本）依次下载模型到 [BASE_MODEL_DIR_PATH] 对应目录下，支持断点续传、多次自动重试。
+
+### 2. 模型训练
+
+```bash
+# 模型训练（LoRA 微调）
 python train.py
 ```
 
-按配置的 `versions` 列表从去重后的 train/valid 数据集中按比例采样子集，进行多轮 LoRA 微调，并将 LORA 保存到 `model/lora_checkpoints/<version>/`，合并后的模型保存到 `model/merged_model/<version>/`。
+- 遍历内部配置的 `MODEL_NAMES` 和 `VERSIONS`，按 `(模型名, 版本, 数据比例)` 组合，从去重后的 train/valid 数据集中按比例采样子集进行 LoRA 微调；
+- LoRA 权重保存到 `model/lora_checkpoints/<模型名>/<版本>/`；
+- 将 LoRA 与基座模型合并后的完整模型保存到 `model/merged_model/<模型名>/<版本>/`。
 
-### 模型评估
-
-模型训练并合并完成后，可以使用 `scripts/evaluate.py` 对合并后的模型版本进行自动评估：
+### 3. 模型评估
 
 ```bash
 cd scripts
 python evaluate.py
 ```
 
-评估脚本会：
-- 从 `merged_model` 目录下自动扫描所有版本；
-- 使用 `data/processed/test_asm_to_c_dedup.jsonl` 中的样本作为测试集；
-- 对每个模型版本执行「反编译 -> 编译验证 -> 最多多轮反馈修复」；
-- 将每个版本的详细评估结果保存到 `eval/<version>.json`，并在终端打印各版本的编译通过率汇总。
-
+- 按配置的 `MODEL_PATH` 评估指定目录下的单个合并模型版本；
+- 使用 `data/processed/test_asm_to_c_dedup.jsonl` 作为测试集；
+- 在评估过程中，对每个样本执行
+  - 反编译 -> 编译 -> 使用错误信息做反馈修复；
+  - 编译成功后调用 LLM 生成 IO 测试用例；
+  - 使用 assert 进行验证。
 
 

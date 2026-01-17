@@ -15,8 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
     libc6-dev-arm64-cross \
     libcapstone-dev capstone-tool \
+    qemu-user \
     && rm -rf /var/lib/apt/lists/*
-
+    
 # 清华 pip 镜像
 RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
     && pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn

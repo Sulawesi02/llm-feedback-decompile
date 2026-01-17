@@ -1,6 +1,4 @@
 import json
-import subprocess
-import tempfile
 import os
 import hashlib
 from pathlib import Path
@@ -12,57 +10,65 @@ import sys
 # 添加项目根目录到 sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import RAW_DATA_DIR, PROCESSED_DATA_DIR
-from src.utils import compile, load_jsonl
+from src.utils import compile_to_object, disassemble_object, load_jsonl
 
 RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# SPLITS = ["train", "valid", "test"]
-SPLITS = ["train"]
-
-TARGETS = [
-    ("x86", "O0"), ("x86", "O1"), ("x86", "O2"), ("x86", "O3"), 
-    ("arm", "O0"), ("arm", "O1"), ("arm", "O2"), ("arm", "O3"), 
-]
+SPLITS = ["train", "valid", "test"]
+ARCHES = ["x86", "arm"]
+OPT_LEVELS = ["O0", "O1", "O2", "O3"]
 
 def extract_c_code(sample):
-    """提取 C 代码"""
+    """
+    提取 C 代码
+    """
     try:
         return sample["text"]["func_def"].strip()
     except Exception:
         return None
 
-def process_single_sample(args):
-    line, c_code = args
-    
-    # 初始化数据结构
+def process_single_sample(c_code: str) -> list:
+    """
+    处理单个 C 代码样本，编译并提取汇编代码和机器码
+    """
     entry = {
         "c_code": c_code,
-        "asm": {
+        "compilations": {
             "x86": {},
             "arm": {}
         }
     }
     
     has_success = False
-    
-    for arch, opt in TARGETS:
-        result = compile(c_code, arch, opt, with_disassembly=True)
-        if result and result.get("success") and result.get("asm") and result.get("machine_code"):
-            entry["asm"][arch][opt] = {
-                "asm": result["asm"],
-                "machine_code": result["machine_code"]
-            }
-            has_success = True
+    for arch in ARCHES:
+        for opt in OPT_LEVELS:
+            compile_result = compile_to_object(c_code, arch, opt)
+            if not compile_result or not compile_result.get("success") or not compile_result.get("binary_path"):
+                continue
+
+            disasm_result = disassemble_object(compile_result["binary_path"], arch)
+            if disasm_result and disasm_result.get("asm") and disasm_result.get("machine_code"):
+                entry["compilations"][arch][opt] = {
+                    "asm": disasm_result["asm"],
+                    "machine_code": disasm_result["machine_code"]
+                }
+                has_success = True
             
     if has_success:
         return [entry]
     return []
 
 def normalize_text(text: str) -> list:
+    """
+    对文本进行归一化处理(替换换行符、制表符和多个空格为单个空格，最后按空格分割为 tokens 列表)
+    """
     return text.replace("\r", "\n").replace("\t", " ").replace("\n", " ").split()
 
 def make_shingles(tokens: list, k: int) -> list:
+    """
+    将 tokens 列表转换为长度为 k 的 shingles 序列
+    """
     if not tokens:
         return []
     if len(tokens) <= k:
@@ -164,7 +170,7 @@ def main():
                             continue
                         c_code = extract_c_code(sample)
                         if c_code:
-                            tasks.append((line, c_code))
+                            tasks.append(c_code)
                             total_samples += 1
 
             print(f"总共找到 {total_samples} 个 C 函数，开始多进程编译...")

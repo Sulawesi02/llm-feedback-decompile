@@ -1,5 +1,5 @@
 #!/bin/bash
-# generate_data.sh
+# download_data.sh
 
 echo "=== ExeBench数据集解压脚本 ==="
 

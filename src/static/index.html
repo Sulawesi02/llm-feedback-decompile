@@ -14,10 +14,10 @@
 
 <div class="container">
     <div class="panel left-panel">
-        <h2>Input Configuration</h2>
+        <h2>输入配置</h2>
         
         <div class="form-group">
-            <label for="arch">Architecture</label>
+            <label for="arch">架构</label>
             <select id="arch">
                 <option value="x86">x86_64</option>
                 <option value="arm">ARM (aarch64)</option>
@@ -25,7 +25,7 @@
         </div>
 
         <div class="form-group">
-            <label for="opt">Optimization Level</label>
+            <label for="opt">优化级别</label>
             <select id="opt">
                 <option value="O0">O0</option>
                 <option value="O1">O1</option>
@@ -35,18 +35,28 @@
         </div>
 
         <div class="form-group">
-            <label for="machine-code">Machine Code (Hex String)</label>
-            <textarea id="machine-code" placeholder="e.g., 55 48 89 e5 89 7d fc 8b 45 fc 0f af c0 5d c3"></textarea>
-            <small style="color: #666;">Enter hex bytes separated by spaces or newlines.</small>
+            <label for="machine-code">机器码（16进制）</label>
+            <textarea id="machine-code" placeholder="例如: 55 48 89 e5 89 7d fc 8b 45 fc 0f af c0 5d c3"></textarea>
+            <small style="color: #666;">输入机器码，每个字节之间用空格或换行符分隔。</small>
         </div>
 
-        <button id="decompile-btn" onclick="decompile()">Decompile</button>
-        <div id="status-msg" class="loading">Processing...</div>
+        <div class="form-group">
+            <label>测试用例（可选）</label>
+            <div class="test-cases-header">
+                <span class="test-header-input">输入</span>
+                <span class="test-header-output">输出</span>
+                <span class="test-header-spacer"></span>
+            </div>
+            <div id="test-cases-container"></div>
+        </div>
+
+        <button id="decompile-btn" onclick="decompile()">反编译</button>
+        <div id="status-msg" class="loading">处理中...</div>
     </div>
 
     <div class="panel right-panel">
-        <h2>Decompiled C Code</h2>
-        <div id="output-code">// Result will appear here...</div>
+        <h2>反编译结果</h2>
+        <div id="output-code">// 反编译结果将显示在这里...</div>
     </div>
 </div>
 

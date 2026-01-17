@@ -1,124 +1,202 @@
 import uvicorn
 import shutil
-import requests
-import os
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pathlib import Path
-from typing import Optional, List, Union
+from typing import Optional, List
 
-from utils import construct_initial_prompt, construct_refine_prompt, clean_c_code, compile
+from config import BASE_MODEL_DIR_PATH, MERGED_MODEL_DIR_PATH
+from utils import (
+    ModelRunner,
+    construct_decompile_prompt,
+    compile_to_object,
+    build_test_harness,
+    run_tests_with_harness,
+    construct_refine_decompile_prompt,
+)
 
 app = FastAPI()
 
-MODEL_SERVER_URL = "http://localhost:8001/generate"
+MODEL_PATH = str(MERGED_MODEL_DIR_PATH / "Qwen2.5-Coder-7B-Instruct" / "v1")
+MAX_ITERS = 3 # 最大迭代次数
 
-# 请求模型
+model_runner = None
+
 class DecompileRequest(BaseModel):
     arch: str # x86 / arm
     opt: str # -O0 / -O1 / -O2 / -O3
     machine_code: str
+    test_cases: Optional[List[dict]] = None
 
-def generate_c_code(messages: Union[str, list]) -> str:
-    """ 调用模型服务生成 C 代码 """
-    try:
-        print(f"请求调用模型服务: {messages}")
-        response = requests.post(MODEL_SERVER_URL, json={"messages": messages})
-        response.raise_for_status() # 抛出HTTP错误
-        result = response.json()
-        c_code = result.get("text")
-        return clean_c_code(c_code)
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 408:
-            print(f"调用模型服务超时 (HTTP 408)")
-            return "// 模型生成超时，请稍后重试"
-        print(f"调用模型服务失败 (HTTP {e.response.status_code}): {e}")
-        return ""
-    except Exception as e:
-        print(f"调用模型服务失败: {e}")
-        return ""
+@app.on_event("startup")
+async def startup_event():
+    global model_runner
+    model_runner = ModelRunner(MODEL_PATH)
 
-# 单次反编译
-@app.post("/decompile")
-async def decompile(request: DecompileRequest):
-    if not request.machine_code.strip():
-        raise HTTPException(status_code=400, detail="机器码不能为空")
-
-    messages = construct_initial_prompt(request.arch, request.opt, request.machine_code)
-    c_code = generate_c_code(messages)
-    return {"c_code": c_code or "// 生成失败，可能是模型服务不可用"}
-
-# 循环反馈反编译
 @app.post("/feedback_decompile")
-async def feedback_decompile(request: DecompileRequest, max_iters: int = 10):
+async def feedback_decompile(request: DecompileRequest):
     if not request.machine_code.strip():
         raise HTTPException(status_code=400, detail="机器码不能为空")
 
-    machine_code = request.machine_code.strip()
-    arch = request.arch
-    opt = request.opt
+    machine_code = request.machine_code.strip() # 机器码
+    arch = request.arch # 架构
+    opt = request.opt # 优化级别
+    raw_cases = request.test_cases or None  # 原始测试用例
+    normalized_cases: List[dict] = []  # 归一化后的测试用例
+    if raw_cases and isinstance(raw_cases, list):
+        for case in raw_cases:
+            input_str = str(case.get("input", "")).strip()
+            output_str = str(case.get("output", "")).strip()
+            if not input_str or not output_str:
+                continue
+            args = [a.strip() for a in input_str.split(",") if a.strip()]
+            if not args:
+                continue
+            normalized_cases.append({"args": args, "expected": output_str})
 
+    messages = construct_decompile_prompt(arch, opt, machine_code)
+    
+    print("生成初始 C 代码...")
+    c_code = model_runner.generate(messages)
+    print(f"初始 C 代码生成完成")
+    
     history = []
     best_c_code = None
 
-    messages = construct_initial_prompt(arch, opt, machine_code)
-    c_code = generate_c_code(messages)
-    history.append({"iter": 0, "c_code": c_code, "status": "generated"})
+    history.append({
+        "iter": 0,
+        "step": "generate",
+        "status": "generated",
+        "c_code": c_code,
+        "message": "初始生成",
+        "error": "",
+        "test_stdout": "",
+        "test_stderr": "",
+    })
 
     if not c_code:
-        return {
-            "final_c_code": "// 模型服务调用失败",
-            "success": False,
-            "total_iterations": 0,
-            "history": history
-        }
+        print("生成为空")
+        return {"final_c_code": "// 模型服务调用失败"}
 
-    for it in range(max_iters):
-        compile_result = compile(c_code, arch, opt)
+    for it in range(MAX_ITERS):
+        print(f"\n--- 迭代 {it+1}/{MAX_ITERS} ---")
+        compile_result = compile_to_object(c_code, arch, opt)
         workdir = compile_result.get("workdir")
 
-        if compile_result["success"]:
-            best_c_code = c_code
-            history.append({
-                "iter": it,
-                "c_code": c_code,
-                "status": "compile_success",
-                "message": "编译成功！"
-            })
-            # 清理临时目录
+        try:
+            if compile_result["success"]:
+                print("编译成功，准备进行测试...")
+                if not normalized_cases:
+                    print("无测试用例，无法测试。")
+                    best_c_code = c_code
+                    history.append({
+                        "iter": it,
+                        "step": "compile",
+                        "status": "compile_success",
+                        "c_code": c_code,
+                        "message": "编译成功",
+                        "error": "",
+                        "test_stdout": "",
+                        "test_stderr": "",
+                    })
+                    break
+                print("构建测试代码...")
+                harness_code = build_test_harness(c_code, normalized_cases)
+                if not harness_code:
+                    print("测试代码构建失败")
+                    history.append({
+                        "iter": it,
+                        "step": "test",
+                        "status": "error",
+                        "c_code": c_code,
+                        "message": "编译成功，构建测试代码失败",
+                        "error": "",
+                        "test_stdout": "",
+                        "test_stderr": "",
+                    })
+                    continue
+                print("运行测试代码...")
+                test_result = run_tests_with_harness(compile_result["binary_path"], arch, harness_code)
+                if test_result["success"]:
+                    print("测试通过。")
+                    best_c_code = c_code
+                    history.append({
+                        "iter": it,
+                        "step": "test",
+                        "status": "test_success",
+                        "c_code": c_code,
+                        "message": "编译成功，测试通过。",
+                        "error": "",
+                        "test_stdout": test_result.get("stdout", ""),
+                        "test_stderr": test_result.get("stderr", ""),
+                    })
+                    break
+                print(f"测试未通过: {test_result['error'][:100]}...")
+                error_msg = test_result["error"][:1000]
+                history.append({
+                    "iter": it,
+                    "step": "test",
+                    "status": "test_failed",
+                    "c_code": c_code,
+                    "message": "编译成功，测试未通过",
+                    "error": error_msg,
+                    "test_stdout": test_result.get("stdout", ""),
+                    "test_stderr": test_result.get("stderr", ""),
+                })
+                print("根据测试错误进行代码修复...")
+                refine_messages = construct_refine_decompile_prompt(c_code, error_msg)
+                c_code = model_runner.generate(refine_messages)
+                if not c_code:
+                    print("修复后代码为空")
+                    history.append({
+                        "iter": it + 1,
+                        "step": "refine",
+                        "status": "error",
+                        "c_code": "",
+                        "message": "模型生成失败",
+                        "error": "",
+                        "test_stdout": "",
+                        "test_stderr": "",
+                    })
+                    break
+                continue
+            error_msg = compile_result["error"][:1000]
+            print(f"编译失败: {error_msg.splitlines()[0] if error_msg else 'Unknown'}...")
+            history.append(
+                {
+                    "iter": it,
+                    "step": "compile",
+                    "status": "compile_failed",
+                    "c_code": c_code,
+                    "message": "",
+                    "error": error_msg,
+                    "test_stdout": "",
+                    "test_stderr": "",
+                }
+            )
+            print("根据编译错误进行代码修复...")
+            refine_messages = construct_refine_decompile_prompt(c_code, error_msg)
+            c_code = model_runner.generate(refine_messages)
+            if not c_code:
+                print("修复后代码为空")
+                history.append({
+                    "iter": it + 1,
+                    "step": "refine",
+                    "status": "error",
+                    "c_code": "",
+                    "message": "模型生成失败",
+                    "error": "",
+                    "test_stdout": "",
+                    "test_stderr": "",
+                })
+                break
+        finally:
             if workdir and Path(workdir).exists():
                 shutil.rmtree(workdir, ignore_errors=True)
-            break
-        else:
-            error_msg = compile_result["error"][:1000]  # 截断过长错误
-            history.append({
-                "iter": it,
-                "c_code": c_code,
-                "status": "compile_failed",
-                "error": error_msg
-            })
 
-            refine_messages = construct_refine_prompt(c_code, error_msg)
-            c_code = generate_c_code(refine_messages)
-            if not c_code:
-                 history.append({"iter": it + 1, "c_code": "", "status": "error", "message": "模型生成失败"})
-                 # 清理临时目录
-                 if workdir and Path(workdir).exists():
-                    shutil.rmtree(workdir, ignore_errors=True)
-                 break
-
-        # 清理临时目录（无论成功失败）
-        if workdir and Path(workdir).exists():
-            shutil.rmtree(workdir, ignore_errors=True)
-
-    # 最终返回
-    return {
-        "final_c_code": best_c_code or c_code,
-        "success": best_c_code is not None,
-        "total_iterations": len(history),
-        "history": history
-    }
+    final_c_code = best_c_code or c_code
+    return {"final_c_code": final_c_code}
 
 # 静态文件服务
 STATIC_DIR = Path(__file__).resolve().parent / "static"

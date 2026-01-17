@@ -9,15 +9,86 @@ import time
 import torch
 from pathlib import Path
 from typing import Dict, List, Optional, Union
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, StoppingCriteria, StoppingCriteriaList
 
-try:
-    from config import TEMP_DIR
-except ImportError:
-    from src.config import TEMP_DIR
+TEMP_DIR = Path("/tmp/workdir")
+
+class ModelRunner:
+    def __init__(self, model_path: str, timeout_seconds: float = 120.0):
+        self.model_path = model_path
+        self.model = None
+        self.tokenizer = None
+        self.timeout_seconds = timeout_seconds
+        self._load_model()
+
+    def _load_model(self):
+        try:
+            model, self.tokenizer = load_model_utils(self.model_path)
+            self.model = model.eval()
+        except Exception as e:
+            print(f"模型加载失败: {e}")
+            raise RuntimeError("模型加载失败")
+
+    def generate(self, messages: Union[str, List[Dict[str, str]]]) -> str:
+        if not self.model:
+            raise RuntimeError("模型未加载")
+
+        print("转换为模型输入格式")
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        print("转换为模型输入张量")
+        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+
+        timeout_criteria = create_timeout_stopping_criteria(self.timeout_seconds)
+        stopping_criteria = StoppingCriteriaList([timeout_criteria])
+
+        try:
+            print("开始生成 C 代码")
+            generated_ids = self.model.generate(
+                **model_inputs,
+                max_new_tokens=2048,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                top_k=None,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                use_cache=True,
+                stopping_criteria=stopping_criteria
+            )
+
+            print("生成完成")
+            generated_ids = [
+                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+            ]
+            print("解码生成结果")
+            response = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+            if timeout_criteria.timed_out:
+                print(f"生成超时 ({self.timeout_seconds}s)")
+                raise TimeoutError(f"生成超时 ({self.timeout_seconds}s)")
+
+            return response.strip()
+        except Exception as e:
+            print(f"生成出错: {e}")
+            return ""
+
+    def unload(self):
+        if self.model:
+            del self.model
+        if self.tokenizer:
+            del self.tokenizer
+        torch.cuda.empty_cache()
+        print("模型资源已释放")
 
 def get_compiler_config(arch: str) -> tuple:
-    """获取指定架构的编译器和参数"""
+    """
+    获取指定架构的编译器和参数
+    """
     if arch == "x86":
         return "gcc", ["-m64"], ["objdump", "-d"]
     elif arch == "arm":
@@ -25,9 +96,12 @@ def get_compiler_config(arch: str) -> tuple:
     else:
         raise ValueError(f"不支持的架构: {arch}")
 
-def compile(c_code: str, arch: str, opt: str, with_disassembly: bool = False) -> dict:
+def compile_to_object(c_code: str, arch: str, opt: str) -> dict:
+    """
+    编译 C 代码为目标文件
+    """
     try:
-        cc, args, objdump_cmd = get_compiler_config(arch)
+        cc, args, _ = get_compiler_config(arch)
     except ValueError as e:
         return {"success": False, "error": str(e), "workdir": None, "binary_path": None}
 
@@ -51,17 +125,25 @@ def compile(c_code: str, arch: str, opt: str, with_disassembly: bool = False) ->
             error_msg = result.stderr.strip() or result.stdout.strip() or "未知编译错误"
             return {"success": False, "error": error_msg, "workdir": workdir, "binary_path": None}
 
-        res = {"success": True, "error": None, "workdir": workdir, "binary_path": str(o_path)}
+        return {"success": True, "error": None, "workdir": workdir, "binary_path": str(o_path)}
+    except Exception as e:
+        return {"success": False, "error": f"编译过程异常: {str(e)}", "workdir": workdir, "binary_path": None}
 
-        if not with_disassembly:
-            return res
+def disassemble_object(binary_path: str, arch: str) -> dict:
+    """
+    反汇编二进制文件，返回汇编代码和机器码
+    """
+    try:
+        _, _, objdump_cmd = get_compiler_config(arch)
+    except ValueError as e:
+        return {"asm": None, "machine_code": None, "error": str(e)}
 
-        objdump_cmd_full = objdump_cmd + [str(o_path)]
-        r = subprocess.run(objdump_cmd_full, capture_output=True, text=True, timeout=30)
+    cmd = objdump_cmd + [str(binary_path)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
-            res["asm"] = None
-            res["machine_code"] = None
-            return res
+            error_msg = r.stderr.strip() or r.stdout.strip() or "objdump 失败"
+            return {"asm": None, "machine_code": None, "error": error_msg}
 
         bytes_out = []
         asm_lines = []
@@ -93,18 +175,16 @@ def compile(c_code: str, arch: str, opt: str, with_disassembly: bool = False) ->
         machine_code = " ".join(bytes_out)
         asm_text = "\n".join(asm_lines).strip()
         if not machine_code or not asm_text:
-            res["asm"] = None
-            res["machine_code"] = None
-            return res
+            return {"asm": None, "machine_code": None, "error": "解析 objdump 输出失败"}
 
-        res["asm"] = asm_text
-        res["machine_code"] = machine_code
-        return res
+        return {"asm": asm_text, "machine_code": machine_code, "error": None}
     except Exception as e:
-        return {"success": False, "error": f"编译过程异常: {str(e)}", "workdir": workdir, "binary_path": None}
+        return {"asm": None, "machine_code": None, "error": f"反汇编过程异常: {str(e)}"}
 
 def load_jsonl(file_path: Union[str, Path]) -> List[Dict]:
-    """加载 JSONL 文件"""
+    """
+    加载 JSONL 文件
+    """
     data = []
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -118,7 +198,9 @@ def load_jsonl(file_path: Union[str, Path]) -> List[Dict]:
     return data
 
 def load_model_utils(model_path: str):
-    """加载量化模型和分词器"""
+    """
+    加载量化模型和分词器
+    """
     try:
         print("定义量化配置...")
         quant_config = BitsAndBytesConfig(
@@ -150,7 +232,9 @@ def load_model_utils(model_path: str):
         raise
 
 def disassemble(machine_code: str, arch: str) -> str:
-    """objdump 将机器码反汇编为汇编代码"""
+    """
+    objdump 将机器码反汇编为汇编代码
+    """
     try:
         # 写入临时二进制文件
         binary_data = bytes.fromhex(machine_code)
@@ -181,8 +265,10 @@ def disassemble(machine_code: str, arch: str) -> str:
     except Exception as e:
         return f"; 反汇编异常: {str(e)}"
 
-def construct_initial_prompt(arch: str, opt: str, machine_code: str) -> List[Dict[str, str]]:
-    """ 构造初始反编译提示 """
+def construct_decompile_prompt(arch: str, opt: str, machine_code: str) -> List[Dict[str, str]]:
+    """
+    构造反编译提示
+    """
     # 反汇编
     assembly_code = disassemble(machine_code, arch)
 
@@ -269,8 +355,10 @@ def construct_initial_prompt(arch: str, opt: str, machine_code: str) -> List[Dic
     ]
     return messages
 
-def construct_refine_prompt(previous_c_code: str, compile_error: str) -> List[Dict[str, str]]:
-    """ 构造修正反编译提示 """
+def construct_refine_decompile_prompt(previous_c_code: str, compile_error: str) -> List[Dict[str, str]]:
+    """
+    构造修正反编译提示
+    """
     messages = [
         {"role": "system", "content": "你是一个专业的二进制反编译专家。"},
         {"role": "user", "content": f"""你之前生成的 C 代码编译失败了。
@@ -289,20 +377,10 @@ def construct_refine_prompt(previous_c_code: str, compile_error: str) -> List[Di
     ]
     return messages
 
-def clean_c_code(text: str) -> str:
-    """ 清理模型输出，提取 C 代码 """
-    # 尝试提取 markdown 代码块
-    pattern = r"```c?(.*?)```"
-    matches = re.findall(pattern, text, re.DOTALL)
-    if matches:
-        return matches[0].strip()
-    return text.strip()
-
 def create_timeout_stopping_criteria(timeout_seconds: float):
-    """创建超时停止条件"""
-    import torch
-    from transformers import StoppingCriteria
-
+    """
+    创建超时停止条件
+    """
     class TimeoutStoppingCriteria(StoppingCriteria):
         def __init__(self, timeout_seconds: float):
             self.start_time = time.time()
@@ -316,3 +394,108 @@ def create_timeout_stopping_criteria(timeout_seconds: float):
             return False
 
     return TimeoutStoppingCriteria(timeout_seconds)
+
+def extract_function_signature(c_code: str) -> Optional[dict]:
+    """
+    从 C 代码中提取函数签名
+    """
+    try:
+        for line in c_code.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            m = re.match(r"([_a-zA-Z][\w\s\*\d]*?)\s+([_a-zA-Z]\w*)\s*\(([^)]*)\)\s*{?", stripped)
+            if m:
+                return {
+                    "return_type": m.group(1).strip(),
+                    "name": m.group(2),
+                    "params": m.group(3).strip(),
+                }
+        return None
+    except Exception as e:
+        return None
+
+def build_test_harness(c_code: str, test_cases: List[dict]) -> Optional[str]:
+    """
+    用测试用例构建测试代码
+    """
+    try:
+        sig = extract_function_signature(c_code)
+    except Exception as e:
+        return None
+    if not sig:
+        return None
+    return_type = sig["return_type"]
+    name = sig["name"]
+    params = sig["params"]
+
+    lines = []
+    lines.append("#include <stdio.h>")
+    lines.append("#include <stdlib.h>")
+    lines.append("#include <string.h>")
+    lines.append("#include <assert.h>")
+    lines.append(f"{return_type} {name}({params});")
+    lines.append("int main() {")
+    for case in test_cases:
+        args = case.get("args")
+        expected = case.get("expected")
+        if not isinstance(args, list) or expected is None:
+            continue
+        args_str = ", ".join(str(a) for a in args)
+        lines.append(f"assert({name}({args_str}) == ({expected}));")
+    lines.append("return 0;")
+    lines.append("}")
+    return "\n".join(lines)
+
+def run_tests_with_harness(obj_path: str, arch: str, test_harness_code: str, timeout_seconds: float = 5.0) -> dict:
+    """
+    运行包含 main 函数的 C 测试代码，验证反编译函数的行为
+    """
+    try:
+        cc, args, _ = get_compiler_config(arch)
+    except ValueError as e:
+        return {"success": False, "error": str(e), "stdout": "", "stderr": ""}
+
+    workdir = Path(obj_path).parent
+    harness_path = workdir / "test_harness.c"
+    exe_path = workdir / "test_exec"
+
+    try:
+        harness_path.write_text(test_harness_code, encoding="utf-8")
+
+        compile_cmd = [cc] + args + [str(obj_path), str(harness_path), "-o", str(exe_path)]
+        compile_result = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=30)
+
+        if compile_result.returncode != 0:
+            error_msg = compile_result.stderr.strip() or compile_result.stdout.strip() or "测试代码编译失败"
+            return {
+                "success": False,
+                "error": error_msg,
+                "stdout": compile_result.stdout,
+                "stderr": compile_result.stderr,
+            }
+
+        if arch == "arm":
+            run_cmd = ["qemu-aarch64", str(exe_path)]
+        else:
+            run_cmd = [str(exe_path)]
+
+        run_result = subprocess.run(run_cmd, capture_output=True, text=True, timeout=timeout_seconds)
+
+        if run_result.returncode == 0:
+            return {
+                "success": True,
+                "error": None,
+                "stdout": run_result.stdout,
+                "stderr": run_result.stderr,
+            }
+
+        msg = run_result.stderr.strip() or run_result.stdout.strip() or f"测试运行失败，退出码 {run_result.returncode}"
+        return {
+            "success": False,
+            "error": msg,
+            "stdout": run_result.stdout,
+            "stderr": run_result.stderr,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"测试执行异常: {str(e)}", "stdout": "", "stderr": ""}
