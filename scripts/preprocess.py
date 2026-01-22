@@ -1,27 +1,33 @@
-import json
 import os
+import json
+import shutil
+import sys
 import hashlib
+import subprocess
+import multiprocessing as mp
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
-import multiprocessing as mp
-import sys
 
 # 添加项目根目录到 sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import RAW_DATA_DIR, PROCESSED_DATA_DIR
-from src.utils import compile_to_object, disassemble_object, load_jsonl
+from src.utils import (
+    compile_to_object,
+    disasm_object,
+    extract_asm_and_machine, 
+    load_jsonl,
+)
 
 RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-SPLITS = ["train", "valid", "test"]
+SPLITS = ["test"]
 ARCHES = ["x86", "arm"]
-OPT_LEVELS = ["O0", "O1", "O2", "O3"]
 
 def extract_c_code(sample):
     """
-    提取 C 代码
+    提取 C 函数代码
     """
     try:
         return sample["text"]["func_def"].strip()
@@ -30,40 +36,42 @@ def extract_c_code(sample):
 
 def process_single_sample(c_code: str) -> list:
     """
-    处理单个 C 代码样本，编译并提取汇编代码和机器码
+    处理单个 C 函数代码样本，编译并提取汇编代码和机器码
     """
     entry = {
         "c_code": c_code,
-        "compilations": {
-            "x86": {},
-            "arm": {}
-        }
+        "compilations": {}
     }
     
     has_success = False
-    for arch in ARCHES:
-        for opt in OPT_LEVELS:
-            compile_result = compile_to_object(c_code, arch, opt)
-            if not compile_result or not compile_result.get("success") or not compile_result.get("binary_path"):
-                continue
-
-            disasm_result = disassemble_object(compile_result["binary_path"], arch)
-            if disasm_result and disasm_result.get("asm") and disasm_result.get("machine_code"):
-                entry["compilations"][arch][opt] = {
-                    "asm": disasm_result["asm"],
-                    "machine_code": disasm_result["machine_code"]
-                }
-                has_success = True
+    try:
+        for arch in ARCHES:
+            compile_result = compile_to_object(arch, c_code)
+            workdir = compile_result["workdir"]
             
-    if has_success:
-        return [entry]
-    return []
+            if compile_result["success"]:
+                disasm_result = disasm_object(arch, compile_result["object_path"])
+                asm, machine_code = extract_asm_and_machine(arch, disasm_result)
+                if asm and machine_code:
+                    entry["compilations"][arch] = {
+                        "asm": asm,
+                        "machine_code": machine_code
+                    }
+                    has_success = True
+        if has_success:
+            return [entry]
+        return []
+    except Exception:
+        return []
+    finally:
+        if workdir and os.path.exists(workdir):
+            shutil.rmtree(workdir, ignore_errors=True)
 
 def normalize_text(text: str) -> list:
     """
     对文本进行归一化处理(替换换行符、制表符和多个空格为单个空格，最后按空格分割为 tokens 列表)
     """
-    return text.replace("\r", "\n").replace("\t", " ").replace("\n", " ").split()
+    return text.replace("\result", "\n").replace("\t", " ").replace("\n", " ").split()
 
 def make_shingles(tokens: list, k: int) -> list:
     """
@@ -159,7 +167,7 @@ def main():
             total_samples = 0
             for i, jsonl_file in enumerate(jsonl_files):
                 print(f"处理文件({i+1}/{len(jsonl_files)}): {jsonl_file.name} ")
-                with open(jsonl_file, "r", encoding="utf-8", errors="ignore") as f:
+                with open(jsonl_file, "result", encoding="utf-8", errors="ignore") as f:
                     for line in f:
                         line = line.strip()
                         if not line:

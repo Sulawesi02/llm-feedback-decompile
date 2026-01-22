@@ -24,9 +24,19 @@ function addTestCaseRow() {
         updateAddButtons();
     });
 
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'remove-test-case-btn';
+    removeBtn.textContent = '-';
+    removeBtn.addEventListener('click', () => {
+        row.remove();
+        updateAddButtons();
+    });
+
     row.appendChild(input);
     row.appendChild(arrow);
     row.appendChild(output);
+    row.appendChild(removeBtn);
     row.appendChild(addBtn);
     container.appendChild(row);
 }
@@ -34,9 +44,16 @@ function addTestCaseRow() {
 function updateAddButtons() {
     const rows = document.querySelectorAll('.test-case-row');
     rows.forEach((row, index) => {
-        const btn = row.querySelector('.add-test-case-btn');
-        if (!btn) return;
-        btn.style.visibility = index === rows.length - 1 ? 'visible' : 'hidden';
+        const addBtn = row.querySelector('.add-test-case-btn');
+        const removeBtn = row.querySelector('.remove-test-case-btn');
+        
+        if (index === rows.length - 1) {
+            if (addBtn) addBtn.style.display = '';
+            if (removeBtn) removeBtn.style.display = 'none';
+        } else {
+            if (addBtn) addBtn.style.display = 'none';
+            if (removeBtn) removeBtn.style.display = '';
+        }
     });
 }
 
@@ -62,18 +79,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
 async function decompile() {
     const btn = document.getElementById('decompile-btn');
-    const status = document.getElementById('status-msg');
     const output = document.getElementById('output-code');
     
     output.textContent = "// 反编译中...";
     output.style.color = "#f8f8f2"; // Reset color
     btn.disabled = true;
-    status.style.display = 'block';
-    status.textContent = "Processing...";
-    status.className = "loading";
 
     const arch = document.getElementById('arch').value;
-    const opt = document.getElementById('opt').value;
     const machineCode = document.getElementById('machine-code').value.trim();
     const testCases = collectTestCases();
 
@@ -81,19 +93,17 @@ async function decompile() {
         output.textContent = "// 错误: 请输入机器码.";
         output.style.color = "#ff6b6b";
         btn.disabled = false;
-        status.style.display = 'none';
         return;
     }
 
     try {
-        const response = await fetch('/feedback_decompile', {
+        const response = await fetch('/decompile', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
                 arch: arch,
-                opt: opt,
                 machine_code: machineCode,
                 test_cases: testCases
             })
@@ -102,7 +112,9 @@ async function decompile() {
         const data = await response.json();
 
         if (response.ok) {
-            output.textContent = data.final_c_code || "// 未生成有效 C 代码.";
+            const isSuccess = data.success;
+            output.textContent = isSuccess ? data.best_c_code || "// 未生成有效 C 函数代码." : `${data.error || '未知错误'}`;
+            output.style.color = isSuccess ? "#f8f8f2" : "#ff6b6b";
         } else {
             output.textContent = `// 服务器错误:\n${data.detail || data.error || '未知错误'}`;
             output.style.color = "#ff6b6b";
@@ -112,6 +124,5 @@ async function decompile() {
         output.style.color = "#ff6b6b";
     } finally {
         btn.disabled = false;
-        status.style.display = 'none';
     }
 }

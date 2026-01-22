@@ -9,6 +9,9 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import BASE_MODEL_DIR_PATH, LORA_CHECKPOINTS_DIR_PATH, MERGED_MODEL_DIR_PATH, TRAIN_DATA_FILE_PATH, VALID_DATA_FILE_PATH
 from src.utils import load_model_utils, load_jsonl
 
+LORA_CHECKPOINTS_DIR_PATH.mkdir(parents=True, exist_ok=True)
+MERGED_MODEL_DIR_PATH.mkdir(parents=True, exist_ok=True)
+
 # 设置 HF 镜像源
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
@@ -17,30 +20,27 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, Pe
 from datasets import Dataset, DatasetDict
 
 MODEL_NAMES = [
-    # "Qwen2.5-Coder-1.5B-Instruct",
-    # "Qwen2.5-Coder-3B-Instruct",
+    "Qwen2.5-Coder-1.5B-Instruct",
+    "Qwen2.5-Coder-3B-Instruct",
     "Qwen2.5-Coder-7B-Instruct",
 ]
 
 VERSIONS = [
-    ("v1", 0.01),
-    ("v2", 0.02),
-    ("v3", 0.05),
-    # ("v4", 1.00)
+    ("v1", 0.05), 
+    ("v2", 0.10),
+    ("v3", 0.20),
 ]
 
 def format_and_tokenize(examples, tokenizer, max_length=256):
     """ 格式化并 tokenize 输入样本 """
     inputs = []
     targets = []
-    for c_code, compilations_data in zip(examples["c_code"], examples["compilations"]):
-        for arch, arch_data in compilations_data.items():
-            for opt, opt_data in arch_data.items():
-                asm_text = opt_data.get("asm")
-                
+    try:
+        for c_code, compilations_data in zip(examples["c_code"], examples["compilations"]):
+            for arch, arch_data in compilations_data.items():
+                asm_text = arch_data["asm"]
                 prompt = (
-                    f"架构: {arch}\n"
-                    f"优化级别: {opt}\n\n"
+                    f"架构: {arch}\n\n"
                     "请将以下汇编代码反编译成等效的 C 函数，要求：\n"
                     "1. 严格保持语义正确；\n"
                     "2. 尽量使用清晰易读的 C 语言写法（如数组下标和规范的控制流结构）；\n"
@@ -57,12 +57,15 @@ def format_and_tokenize(examples, tokenizer, max_length=256):
                 )
                 inputs.append(tokenized["input_ids"])
                 targets.append(tokenized["input_ids"])
+        return {
+            "input_ids": inputs,
+            "attention_mask": [[1] * len(x) for x in inputs],
+            "labels": targets,
+        }
+    except Exception as e:
+        print(f"格式化和 tokenize 过程中出错: {e}")
+        return None
 
-    return {
-        "input_ids": inputs,
-        "attention_mask": [[1] * len(x) for x in inputs],
-        "labels": targets,
-    }
 
 def train_model(model_name, version, ratio):
     base_model_path = BASE_MODEL_DIR_PATH / model_name
@@ -222,10 +225,7 @@ def train_model(model_name, version, ratio):
         torch.cuda.empty_cache()
         gc.collect()
     
-def main():
-    LORA_CHECKPOINTS_DIR_PATH.mkdir(parents=True, exist_ok=True)
-    MERGED_MODEL_DIR_PATH.mkdir(parents=True, exist_ok=True)
-    
+def main():    
     for model_name in MODEL_NAMES:
         for version, ratio in VERSIONS:
             try:

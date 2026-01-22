@@ -3,6 +3,7 @@ import json
 import shutil
 import sys
 import re
+import time
 from pathlib import Path
 from typing import List
 from tqdm import tqdm
@@ -12,17 +13,118 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import BASE_MODEL_DIR_PATH, MERGED_MODEL_DIR_PATH, TEST_DATA_FILE_PATH, EVAL_DIR
 from src.utils import (
     ModelRunner,
+    machine_code_to_binary,
+    disasm_binary,
+    extract_asm,
     construct_decompile_prompt,
+    clean_code_block,
     compile_to_object,
     build_test_harness,
-    run_tests_with_harness,
-    construct_refine_decompile_prompt,
+    run_test_harness,
+    extract_function_signature,
 )
 
 # MODEL_PATH = str(BASE_MODEL_DIR_PATH / "Qwen2.5-Coder-7B-Instruct")
 MODEL_PATH = str(MERGED_MODEL_DIR_PATH / "Qwen2.5-Coder-7B-Instruct" / "v1")
-MAX_SAMPLES = 50 # 最大样本数
+MAX_SAMPLES = 200 # 最大样本数
 MAX_ITERS = 3 # 最大迭代次数
+
+model_runner = None
+
+def is_simple_literal(val: str) -> bool:
+    """
+    检查是否为简单字面量
+    """
+    # 1. 布尔值
+    if val.lower() in ("true", "false"):
+        return True
+    
+    # 2. 空指针常量
+    if val in ("NULL", "nullptr", "0", "null"):
+        return True
+    
+    # 3. 整数
+    # 十进制整数
+    if re.fullmatch(r"-?\d+", val):
+        return True
+    # 二进制整数（0b或0B开头）
+    if re.fullmatch(r"-?0[bB][01]+", val):
+        return True
+    # 八进制整数（0开头）
+    if re.fullmatch(r"-?0[0-7]+", val):
+        return True    
+    # 十六进制整数（0x或0X开头）
+    if re.fullmatch(r"-?0[xX][0-9a-fA-F]+", val):
+        return True
+    
+    # 4. 浮点数
+    # 标准形式
+    if re.fullmatch(r"-?\d+\.\d*", val):
+        return True
+    # 省略整数部分
+    if re.fullmatch(r"-?\.\d+", val):
+        return True
+    # 科学计数法
+    if re.fullmatch(r"-?\d+\.\d*[eE][+-]?\d+", val):
+        return True
+    if re.fullmatch(r"-?\.\d+[eE][+-]?\d+", val):
+        return True
+    # 整数科学计数法
+    if re.fullmatch(r"-?\d+[eE][+-]?\d+", val):
+        return True
+    
+    # 5. 字符
+    if re.match(r"^'.'$", val):
+        return True
+    
+    # 6. 字符串
+    if re.match(r'^".*"$', val):
+        return True
+
+    return False
+
+def has_meaningful_return(code: str) -> bool:
+    """
+    检查代码是否有有意义的返回值。
+    如果返回类型是 void，或者只返回常数/空，则认为无意义。
+    """
+    sig = extract_function_signature(code)
+    if sig:
+        rt = sig["return_type"]
+        # void 且非指针
+        if re.search(r'\bvoid\b', rt) and "*" not in rt:
+            return False
+
+    for raw_line in code.splitlines():
+        line = raw_line.strip()
+        
+        # 忽略注释
+        if line.startswith("//") or line.startswith("/*") or line.startswith("*"):
+            continue
+        
+        # 筛选 return 语句
+        if not re.match(r"^return\b", line):
+            continue
+        
+        # 提取返回值
+        match = re.match(r"^return\b\s*(.*?)\s*;?\s*$", line)
+        if not match:
+            continue
+        
+        # 移除可能的空格
+        val = match.group(1).strip()
+        if not val:
+            continue
+        
+        # 去除可能的括号 return (0);
+        while val.startswith("(") and val.endswith(")"):
+            val = val[1:-1].strip()
+        
+        # 简单字面量检查
+        if is_simple_literal(val):
+            continue
+        return True
+    return False
 
 def parse_generated_tests(text: str) -> List[dict]:
     """
@@ -46,75 +148,112 @@ def parse_generated_tests(text: str) -> List[dict]:
         cases.append({"args": args, "expected": output_str})
     return cases
 
-def has_meaningful_return(code: str) -> bool:
-    for raw_line in code.splitlines():
-        line = raw_line.strip()
-        if not line.startswith("return"):
-            continue
-        if re.fullmatch(r"return\s*;\s*", line):
-            continue
-        if not line.startswith("return "):
-            continue
-        body = line[len("return ") :]
-        if ";" in body:
-            body = body.split(";", 1)[0]
-        body = body.strip()
-        if not body:
-            continue
-        if re.fullmatch(r"-?\d+", body):
-            continue
-        return True
-    return False
-
-def evaluate_single_task(model_runner, sample_index: int, task: dict):
+def evaluate_single_task(sample_index: int, task: dict):
     """
     评估单个任务
     """
     arch = task["arch"]
-    opt = task["opt"]
     machine_code = task["machine_code"]
     source_c_code = task["source_c_code"]
     
     print(f"\n{'='*50}")
-    print(f"开始评估: 样本 {sample_index} | 架构: {arch} | 优化: {opt}")
+    print(f"开始评估: 样本 {sample_index} | 架构: {arch}")
     print(f"{'='*50}")
 
-    messages = construct_decompile_prompt(arch, opt, machine_code)
+    c_code = None
+    previous_c_code = None
+    last_error = None
     
-    print("生成初始 C 代码...")
-    c_code = model_runner.generate(messages)
-    print(f"初始 C 代码生成完成")
-
     history = []
     best_c_code = None
-
-    history.append({
-        "iter": 0,
-        "step": "generate",
-        "status": "generated",
-        "c_code": c_code,
-        "message": "初始生成",
-        "error": "",
-        "test_stdout": "",
-        "test_stderr": "",
-    })
-
-    if not c_code:
-        print("初始代码生成为空")
-        result_entry = {
-            "id": f"{sample_index}_{task['id_suffix']}" if task["id_suffix"] else sample_index,
-            "arch": arch,
-            "opt": opt,
-            "success": False,
-            "final_c_code": "",
-            "history": history,
-        }
-        return result_entry, False
+    
+    start_time = time.time()
+    TOTAL_TIMEOUT = 120.0
 
     for it in range(MAX_ITERS):
         print(f"\n--- 迭代 {it+1}/{MAX_ITERS} ---")
-        compile_result = compile_to_object(c_code, arch, opt)
-        workdir = compile_result.get("workdir")
+        
+        elapsed = time.time() - start_time
+        remaining = TOTAL_TIMEOUT - elapsed
+        if remaining <= 0:
+            print("总处理时间超时")
+            history.append({
+                "iter": it,
+                "step": "timeout",
+                "status": "error",
+                "c_code": "",
+                "message": "处理超时",
+                "error": "处理超时",
+                "test_stdout": "",
+                "test_stderr": "",
+            })
+            break
+        
+        binary_path = machine_code_to_binary(machine_code)
+        if not binary_path:
+            print("机器码转换为二进制失败")
+            history.append({
+                "iter": it,
+                "step": "binary",
+                "status": "error",
+                "c_code": "",
+                "message": "机器码转换为二进制失败",
+                "error": "机器码转换为二进制失败",
+                "test_stdout": "",
+                "test_stderr": "",
+            })
+            break
+        
+        disasm_result = disasm_binary(arch, binary_path)
+        if not disasm_result:
+            print("反汇编二进制文件失败")
+            history.append({
+                "iter": it,
+                "step": "disasm",
+                "status": "error",
+                "c_code": "",
+                "message": "反汇编二进制文件失败",
+                "error": "反汇编二进制文件失败",
+                "test_stdout": "",
+                "test_stderr": "",
+            })
+            break
+        asm = extract_asm(arch, disasm_result)
+        if it == 0:
+            print("生成初始 C 函数代码...")
+            messages = construct_decompile_prompt(arch, asm)
+        else:
+            print("生成修复 C 函数代码...")
+            messages = construct_decompile_prompt(arch, asm, previous_c_code, last_error)
+        c_code = model_runner.generate(messages, timeout=remaining)
+        c_code = clean_code_block(c_code)
+        print("C 函数代码生成完成")
+        history.append({
+            "iter": it,
+            "step": "generate" if it == 0 else "refine",
+            "status": "generated",
+            "c_code": c_code,
+            "message": "生成初始 C 函数代码" if it == 0 else "生成修复 C 函数代码",
+            "error": "",
+            "test_stdout": "",
+            "test_stderr": "",
+        })
+        
+        if not c_code:
+            print("生成的 C 函数代码为空")
+            history.append({
+                "iter": it,
+                "step": "generate" if it == 0 else "refine",
+                "status": "error",
+                "c_code": "",
+                "message": "生成的 C 函数代码为空",
+                "error": "生成的 C 函数代码为空",
+                "test_stdout": "",
+                "test_stderr": "",
+            })
+            break
+
+        compile_result = compile_to_object(arch, c_code)
 
         try:
             if compile_result["success"]:
@@ -188,7 +327,7 @@ def evaluate_single_task(model_runner, sample_index: int, task: dict):
                     })
                     continue
                 print("运行测试代码...")
-                test_result = run_tests_with_harness(compile_result["binary_path"], arch, harness_code)
+                test_result = run_test_harness(arch, compile_result["binary_path"], harness_code)
                 if test_result["success"]:
                     print("测试通过。")
                     best_c_code = c_code
@@ -215,22 +354,8 @@ def evaluate_single_task(model_runner, sample_index: int, task: dict):
                     "test_stdout": test_result.get("stdout", ""),
                     "test_stderr": test_result.get("stderr", ""),
                 })
-                print("根据测试错误进行代码修复...")
-                refine_messages = construct_refine_decompile_prompt(c_code, error_msg)
-                c_code = model_runner.generate(refine_messages)
-                if not c_code:
-                    print("修复后代码为空")
-                    history.append({
-                        "iter": it + 1,
-                        "step": "refine",
-                        "status": "error",
-                        "c_code": "",
-                        "message": "模型生成失败",
-                        "error": "",
-                        "test_stdout": "",
-                        "test_stderr": "",
-                    })
-                    break
+                previous_c_code = c_code
+                last_error = error_msg
                 continue
             error_msg = compile_result["error"][:1000]
             print(f"编译失败: {error_msg.splitlines()[0] if error_msg else 'Unknown'}...")
@@ -246,41 +371,32 @@ def evaluate_single_task(model_runner, sample_index: int, task: dict):
                     "test_stderr": "",
                 }
             )
-            print("根据编译错误进行代码修复...")
-            refine_messages = construct_refine_decompile_prompt(c_code, error_msg)
-            c_code = model_runner.generate(refine_messages)
-            if not c_code:
-                print("修复后代码为空")
-                history.append({
-                    "iter": it + 1,
-                    "step": "refine",
-                    "status": "error",
-                    "c_code": "",
-                    "message": "模型生成失败",
-                    "error": "",
-                    "test_stdout": "",
-                    "test_stderr": "",
-                })
-                break
+            previous_c_code = c_code
+            last_error = error_msg
+            continue
+        except Exception as e:
+            print(f"处理样本 {sample_index} 时出错: {e}")
+            continue
         finally:
-            if workdir and Path(workdir).exists():
-                shutil.rmtree(workdir, ignore_errors=True)
+            if compile_result.get("workdir") and os.path.exists(compile_result["workdir"]):
+                shutil.rmtree(compile_result["workdir"], ignore_errors=True)
 
-    final_c_code = best_c_code or c_code
-    final_success = best_c_code is not None
-    print(f"任务结束 | 最终状态: {'成功' if final_success else '失败'}")
+    is_success = best_c_code is not None
+    print(f"任务结束 | 最终状态: {'成功' if is_success else '失败'}")
     result_entry = {
         "id": f"{sample_index}_{task['id_suffix']}" if task["id_suffix"] else sample_index,
         "arch": arch,
-        "opt": opt,
-        "success": final_c_code,
-        "final_c_code": final_c_code,
+        "success": is_success,
+        "machine_code": task["machine_code"],
+        "source_c_code": task["source_c_code"],
+        "best_c_code": best_c_code,
         "history": history,
     }
-    return result_entry, final_success
+    return result_entry, is_success
 
-def evaluate_model(model_path: str, output_path: str):
-    model_runner = ModelRunner(model_path)
+def evaluate_model(output_path: str):
+    global model_runner
+    model_runner = ModelRunner(MODEL_PATH)
 
     results = []
     success_count = 0
@@ -297,21 +413,19 @@ def evaluate_model(model_path: str, output_path: str):
                 data = json.loads(line)
                 tasks = []
                 for arch, arch_data in data["compilations"].items():
-                    for opt, opt_data in arch_data.items():
-                        tasks.append(
-                            {
-                                "arch": arch,
-                                "opt": opt,
-                                "machine_code": opt_data.get("machine_code"),
-                                "source_c_code": data.get("c_code"),
-                                "id_suffix": f"{arch}_{opt}",
-                            }
-                        )
+                    tasks.append(
+                        {
+                            "arch": arch,
+                            "machine_code": arch_data.get("machine_code"),
+                            "source_c_code": data.get("c_code"),
+                            "id_suffix": arch,
+                        }
+                    )
 
                 for task in tasks:
-                    result_entry, final_success = evaluate_single_task(model_runner, i, task)
+                    result_entry, is_success = evaluate_single_task(i, task)
                     results.append(result_entry)
-                    if final_success:
+                    if is_success:
                         success_count += 1
                     total_count += 1
 
@@ -329,7 +443,7 @@ def evaluate_model(model_path: str, output_path: str):
         json.dump(results, f, indent=2, ensure_ascii=False)
 
     accuracy = success_count / total_count if total_count > 0 else 0
-    print(f"\n评估完成: {os.path.basename(model_path)}")
+    print(f"\n评估完成: {os.path.basename(MODEL_PATH)}")
     print(f"总样本数: {total_count}")
     print(f"成功编译数: {success_count}")
     print(f"编译通过率: {accuracy:.2%}")
@@ -344,10 +458,8 @@ def main():
         return
 
     try:
-        evaluate_model(
-            MODEL_PATH,
-            str(output_path)
-        )
+        print(f"开始评估模型: {MODEL_PATH}")
+        evaluate_model(str(output_path))
     except Exception as e:
         print(f"评估模型失败: {e}")
 
