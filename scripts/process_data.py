@@ -1,38 +1,29 @@
 import os
 import json
-import shutil
 import sys
 import hashlib
-import subprocess
 import multiprocessing as mp
+import shutil
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
+from datasets import load_dataset
 
 # 添加项目根目录到 sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from src.config import RAW_DATA_DIR, PROCESSED_DATA_DIR
+from src.config import (
+    RAW_DATA_DIR, 
+    PROCESSED_DATA_DIR, 
+    DEDUPLICATED_DATA_DIR,
+)
 from src.utils import (
     compile_to_object,
     disasm_object,
     extract_asm_and_machine, 
-    load_jsonl,
 )
 
-RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-SPLITS = ["test"]
+SPLITS = ["train", "valid", "test"]
 ARCHES = ["x86", "arm"]
-
-def extract_c_code(sample):
-    """
-    提取 C 函数代码
-    """
-    try:
-        return sample["text"]["func_def"].strip()
-    except Exception:
-        return None
 
 def process_single_sample(c_code: str) -> list:
     """
@@ -44,13 +35,13 @@ def process_single_sample(c_code: str) -> list:
     }
     
     has_success = False
+    created_workdirs = []
     try:
         for arch in ARCHES:
-            compile_result = compile_to_object(arch, c_code)
-            workdir = compile_result["workdir"]
-            
-            if compile_result["success"]:
-                disasm_result = disasm_object(arch, compile_result["object_path"])
+            success, _, o_path = compile_to_object(arch, c_code)
+            if success and o_path:
+                created_workdirs.append(Path(o_path).parent)
+                disasm_result = disasm_object(arch, o_path)
                 asm, machine_code = extract_asm_and_machine(arch, disasm_result)
                 if asm and machine_code:
                     entry["compilations"][arch] = {
@@ -64,14 +55,15 @@ def process_single_sample(c_code: str) -> list:
     except Exception:
         return []
     finally:
-        if workdir and os.path.exists(workdir):
-            shutil.rmtree(workdir, ignore_errors=True)
+        for workdir in created_workdirs:
+            if workdir and workdir.exists():
+                shutil.rmtree(workdir, ignore_errors=True)
 
 def normalize_text(text: str) -> list:
     """
     对文本进行归一化处理(替换换行符、制表符和多个空格为单个空格，最后按空格分割为 tokens 列表)
     """
-    return text.replace("\result", "\n").replace("\t", " ").replace("\n", " ").split()
+    return text.replace("\r", "\n").replace("\t", " ").replace("\n", " ").split()
 
 def make_shingles(tokens: list, k: int) -> list:
     """
@@ -135,7 +127,11 @@ def lsh_deduplicate(records: list, field: str = "asm", num_perm: int = 64, bands
 def deduplicate_jsonl(input_path: Path, output_path: Path, field: str = "asm", num_perm: int = 64, bands: int = 8, shingle_size: int = 5) -> tuple:
     input_path = Path(input_path)
     output_path = Path(output_path)
-    records = load_jsonl(input_path)
+    try:
+        dataset = load_dataset("json", data_files=str(input_path), split="train")
+        records = [row for row in dataset]
+    except Exception as e:
+        records = []
     dedup_records, _ = lsh_deduplicate(
         records,
         field=field,
@@ -149,14 +145,20 @@ def deduplicate_jsonl(input_path: Path, output_path: Path, field: str = "asm", n
     return len(records), len(dedup_records)
 
 def main():
+    RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DEDUPLICATED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    
     for split in SPLITS:
         split_dir = RAW_DATA_DIR / split
-        raw_out_path = PROCESSED_DATA_DIR / f"{split}_asm_to_c.jsonl"
-        dedup_out_path = PROCESSED_DATA_DIR / f"{split}_asm_to_c_dedup.jsonl"
+        processed_out_path = PROCESSED_DATA_DIR / f"{split}_data.jsonl"
+        deduplicated_out_path = DEDUPLICATED_DATA_DIR / f"{split}_data.jsonl"
 
-        if dedup_out_path.exists():
-            print(f"\n{split} 的 asm_to_c 文件已存在，跳过生成: {dedup_out_path}")
-        else:
+        if processed_out_path.exists() and deduplicated_out_path.exists():
+            print(f"\n{split} 的 data 文件已存在，跳过生成")
+            continue
+
+        if not processed_out_path.exists():
             jsonl_files = list(split_dir.glob("*.jsonl"))
             if split == "train":
                 jsonl_files = jsonl_files[:6]
@@ -167,7 +169,7 @@ def main():
             total_samples = 0
             for i, jsonl_file in enumerate(jsonl_files):
                 print(f"处理文件({i+1}/{len(jsonl_files)}): {jsonl_file.name} ")
-                with open(jsonl_file, "result", encoding="utf-8", errors="ignore") as f:
+                with open(jsonl_file, "r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -176,7 +178,7 @@ def main():
                             sample = json.loads(line)
                         except:
                             continue
-                        c_code = extract_c_code(sample)
+                        c_code = sample["text"]["func_def"].strip()
                         if c_code:
                             tasks.append(c_code)
                             total_samples += 1
@@ -187,7 +189,7 @@ def main():
             print(f"使用 {max_workers} 个进程并行处理")
 
             results_generated = 0
-            with open(raw_out_path, "w", encoding="utf-8") as out_f:
+            with open(processed_out_path, "w", encoding="utf-8") as out_f:
                 if tasks:
                     with ProcessPoolExecutor(max_workers=max_workers) as executor:
                         future_to_task = {executor.submit(process_single_sample, task): task for task in tasks}
@@ -197,24 +199,25 @@ def main():
                                 out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
                                 results_generated += 1
 
-            print(f"{split} 处理完成！生成 {results_generated} 条 asm_to_c 数据")
-            print(f"保存到: {raw_out_path}")
+            print(f"\n{split} 处理完成！生成 {results_generated} 条数据")
+            print(f"\n保存到: {processed_out_path}")
+        else:
+            print(f"\n{split} 的 processed_data 文件已存在，跳过生成: {processed_out_path}")
 
-            # 去重处理
+        if not deduplicated_out_path.exists():
+            print(f"\n开始对 {split} 数据进行去重...")
             before_num, after_num = deduplicate_jsonl(
-                input_path=raw_out_path,
-                output_path=dedup_out_path,
+                input_path=processed_out_path,
+                output_path=deduplicated_out_path,
                 field="c_code",
                 num_perm=64,
                 bands=8,
                 shingle_size=5,
             )
             print(f"{split} 去重完成: {before_num} -> {after_num}")
-            print(f"去重后数据保存到: {dedup_out_path}")
-
-            # 删除原始文件
-            if raw_out_path.exists():
-                raw_out_path.unlink()
+            print(f"去重后数据保存到: {deduplicated_out_path}")
+        else:
+            print(f"\n{split} 的 deduplicated_data 文件已存在，跳过生成: {deduplicated_out_path}")
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)

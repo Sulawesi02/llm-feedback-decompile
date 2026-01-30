@@ -2,21 +2,14 @@ import os
 import time
 import sys
 from pathlib import Path
-from huggingface_hub import snapshot_download
 
-# 添加项目根目录到 sys.path 以便导入 config
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-from src.config import BASE_MODEL_DIR_PATH
-
-# 设置 HF 镜像源 (如果没有设置的话)
 if "HF_ENDPOINT" not in os.environ:
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+from huggingface_hub import snapshot_download
 
-MODEL_NAMES = [
-    "Qwen2.5-Coder-1.5B-Instruct",
-    "Qwen2.5-Coder-3B-Instruct",
-    "Qwen2.5-Coder-7B-Instruct",
-]
+# 添加项目根目录到 sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from src.config import MODEL_NAME, BASE_MODEL_DIR
 
 def download_base_model(repo_id: str, local_dir: Path, max_retries=10):
     """
@@ -46,22 +39,24 @@ def download_base_model(repo_id: str, local_dir: Path, max_retries=10):
             else:
                 raise RuntimeError(f"模型下载失败，已重试 {max_retries} 次") from e
 
-def main():    
-    for model_name in MODEL_NAMES:
-        model_path = BASE_MODEL_DIR_PATH / model_name
-        
-        if model_path.exists() and (model_path / "config.json").exists():
-            print(f"{model_name} 已存在，跳过下载。")
-            continue
-            
-        try:
-            print(f"开始下载 {model_name}")
-            download_base_model(model_name, model_path)
-        except Exception as e:
-            print(f"{model_name} 下载失败: {e} !!")
-            continue
-            
-    print("所有下载任务处理完成！")
+def main():
+    if not MODEL_NAME:
+        print("错误: 模型名称未配置")
+        return
+    if not BASE_MODEL_DIR:
+        print("错误: 基座模型目录未配置")
+        return
+    base_model_path = BASE_MODEL_DIR / MODEL_NAME
+    base_model_path.mkdir(parents=True, exist_ok=True)
+    
+    if base_model_path.exists() and (base_model_path / "config.json").exists():
+        print(f"{MODEL_NAME} 已存在，跳过下载。")
+        return
+    
+    try:
+        download_base_model(MODEL_NAME, base_model_path)
+    except Exception as e:
+        print(f"{MODEL_NAME} 下载失败: {e} !!")
 
 if __name__ == "__main__":
     main()

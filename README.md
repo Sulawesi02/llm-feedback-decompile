@@ -10,6 +10,7 @@
 - **Web 可视化界面**：提供直观的 Web UI，用户可直接输入 Hex 格式的机器码并查看反编译结果。
 
 ## 快速开始
+
 ### 1. 构建环境
 推荐使用 Docker 容器以确保编译器环境一致性：
 ```bash
@@ -17,18 +18,23 @@ docker build -t llm-feedback-decompile-env .
 ```
 
 ### 2. 启动环境
+
+启动容器并将当前目录挂载到容器内的 `/app` 目录：
+
 ```bash
 docker run --gpus all -it -p 8000:8000 -v ${PWD}:/app llm-feedback-decompile-env
 ```
 
 ### 3. 启动服务
+
 进入容器后，启动 Web 服务（端口 8000）：
 
 ```bash
-cd src
-python app.py
+python src/app.py
 ```
+
 ### 4. 访问界面
+
 服务启动成功后，请在浏览器中访问：
 http://localhost:8000
 
@@ -38,28 +44,20 @@ http://localhost:8000
 
 本项目模型训练主要基于 **ExeBench** 数据集。
 
-### 1. 下载 ExeBench 数据集
-https://huggingface.co/datasets/jordiae/exebench/tree/main
+### 1. 下载与准备 ExeBench 数据集
 
-### 2. 解压 ExeBench 数据集
 ```bash
-cd scripts
-# 解压 ExeBench 数据集
-./extract_data.sh
+python scripts/dataset.py
 ```
 
-- 在 `data/exebench` 目录下创建 `train` 、 `valid` 、 `test` 子目录。
-- 在每个子目录下解压下载的 JSONL 文件。
+- 下载 `train_synth_simple_io`, `valid_synth`, `test_synth` 等关键子集。
+- 自动解压并保存到 `data/raw_data/<train/valid/test>` 目录下。
 
 #### ExeBench 数据集统计
 | 数据集类别 | 数量 | 描述 |
 | :--- | :--- | :--- |
-| `train_not_compilable` | 2.357M | 训练集不可编译代码 |
-| `train_synth_compilable` | 2.308M | 训练集合成代码（可编译） |
-| `train_real_compilable` | 0.675M | 训练集真实代码（可编译） |
 | `train_synth_simple_io` | 0.550M | 训练集合成代码（简单I/O） |
 | `train_real_simple_io` | 0.043M | 训练集真实代码（简单I/O） |
-| `train_synth_rich_io` | 0.097M | 训练集合成代码（丰富I/O） |
 | `valid_synth` | 5k | 验证集合成代码 |
 | `valid_real` | 2.133k | 验证集真实代码 |
 | `test_synth` | 5k | 测试集合成代码 |
@@ -142,19 +140,19 @@ ExeBench 数据集采用 JSONL 格式存储，每条记录包含完整的函数�
 }
 ```
 
-### 3. 数据预处理
+### 2. 数据处理
+
 ```bash
-# 数据预处理
-python preprocess.py
+python scripts/process_data.py
 ```
 
-- 从 `data/exebench` 目录加载 JSONL 数据；
-- 提取 C 函数代码，编译并生成汇编代码和机器码；
+- 从 `data/raw_data/<train/valid/test>` 目录加载原始数据；
+- 提取 C 函数代码，编译并提取汇编代码和机器码；
 - 通过计算代码的 MinHash 并利用局部敏感哈希（LSH）删除重复样本；
   - train : 10379 -> 9412
   - valid : 1792 -> 1614
   - test : 1872 -> 1650
-- 保存处理后的样本到 `data/processed` 目录。
+- 去重样本保存到 `data/dpo_data` 目录。
 
 #### 处理后的样本格式
 ```json
@@ -165,10 +163,7 @@ python preprocess.py
       "asm": "汇编代码",
       "machine_code": "机器码"
     },
-    "arm": {
-      "asm": "汇编代码",
-      "machine_code": "机器码"
-    }
+    "arm": {...}
   }
 }
 ```
@@ -180,35 +175,61 @@ python preprocess.py
 ### 1. 下载基座模型
 
 ```bash
-# 下载基座模型
-python download_model.py
+python scripts/basemodel.py
 ```
 
-- 按配置的 `MODEL_NAMES` 列表（如 1.5B/3B/7B 版本）依次下载模型到 [BASE_MODEL_DIR_PATH] 对应目录下，支持断点续传、多次自动重试。
+- 按配置的 `MODEL_NAME` 下载基座模型，支持断点续传、多次自动重试。
+- 基座模型保存到 `model/base_models/<模型名>/` 。
 
-### 2. 模型训练
+### 2. SFT 微调
+
+**核心目标**：通过有监督微调 (Supervised Fine-Tuning)，让模型学会将汇编代码翻译为语义等价的 C 代码（Next Token Prediction）。
 
 ```bash
-# 模型训练（LoRA 微调）
-python train.py
+python scripts/train_sft.py
 ```
 
-- 遍历内部配置的 `MODEL_NAMES` 和 `VERSIONS`，按 `(模型名, 版本, 数据比例)` 组合，从去重后的 train/valid 数据集中按比例采样子集进行 LoRA 微调；
-- LoRA 权重保存到 `model/lora_checkpoints/<模型名>/<版本>/`；
-- 将 LoRA 与基座模型合并后的完整模型保存到 `model/merged_model/<模型名>/<版本>/`。
+- 遍历`VERSIONS`，从去重后的 <train/valid> 数据集中按比例采样子集。
+- 将 (架构, 汇编, C代码) 格式化为对话 Prompt。
+- 进行 QLoRA 微调，权重保存到 `model/sft_adapter/<版本>/`。
 
-### 3. 模型评估
+### 3. 生成 DPO 数据
 
 ```bash
-cd scripts
-python evaluate.py
+python scripts/process_dpo_data.py
 ```
 
-- 按配置的 `MODEL_PATH` 评估指定目录下的单个合并模型版本；
-- 使用 `data/processed/test_asm_to_c_dedup.jsonl` 作为测试集；
-- 在评估过程中，对每个样本执行
-  - 反编译 -> 编译 -> 使用错误信息做反馈修复；
-  - 编译成功后调用 LLM 生成 IO 测试用例；
-  - 使用 assert 进行验证。
+- 加载 **基座模型 + SFT 适配器**。
+- 对每条训练样本，生成候选 C 代码。
+- **编译验证**：尝试编译每个候选代码。
+- **构造偏好对**：
+  - **Chosen (正例)**：原始数据集中正确的 C 代码。
+  - **Rejected (负例)**：SFT 模型基于正确 C 代码生成的 **错误/低质量** 代码（Bad Code Generation）。
+- 生成的 DPO 数据保存到 `data/dpo_data/<模型名>/<版本>/`。
+
+### 4. DPO 对齐
+
+**核心目标**：通过直接偏好优化 (Direct Preference Optimization)，抑制模型生成不可编译或低质量代码的倾向。
+
+```bash
+python scripts/train_dpo.py
+```
+
+- 加载 **基座模型** 并 **合并 SFT 适配器** 作为新的基座。
+- 加载生成的 DPO 数据集。
+- 进行 DPO 微调，训练一个新的 DPO 适配器，权重保存到 `model/dpo_adapter/<版本>/`。
+
+### 5. 模型评估
+
+```bash
+python scripts/evaluate.py
+```
+
+- 加载 **基座模型**，同时挂载 **SFT 适配器** 和 **DPO 适配器**。
+- 在测试集上评估反编译成功率和语义等价性。
+- 结果保存到 `eval/<模型名>/<版本>.jsonl`。
+
+
+
 
 

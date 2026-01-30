@@ -27,14 +27,18 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# Virtual Environment
+# Virtual Environment (Standard & uv)
 venv/
 env/
 ENV/
 .env
-.venv
+.venv/
+
+# uv specific
+.uv/
 
 # IDEs
+.trae/
 .idea/
 .vscode/
 *.swp
