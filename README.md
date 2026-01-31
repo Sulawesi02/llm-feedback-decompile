@@ -181,7 +181,18 @@ python scripts/basemodel.py
 - 按配置的 `MODEL_NAME` 下载基座模型，支持断点续传、多次自动重试。
 - 基座模型保存到 `model/base_models/<模型名>/` 。
 
-### 2. SFT 微调
+### 2. 生成 SFT 数据
+
+```bash
+python scripts/process_sft_data.py
+```
+
+- 构造 SFT 数据集
+  - instruction : arch + 汇编代码
+  - response : C 代码
+- 生成的 SFT 数据保存到 `data/sft_data/<train/valid>_data.jsonl`。
+
+### 3. SFT 微调
 
 **核心目标**：通过有监督微调 (Supervised Fine-Tuning)，让模型学会将汇编代码翻译为语义等价的 C 代码（Next Token Prediction）。
 
@@ -189,25 +200,23 @@ python scripts/basemodel.py
 python scripts/train_sft.py
 ```
 
-- 遍历`VERSIONS`，从去重后的 <train/valid> 数据集中按比例采样子集。
-- 将 (架构, 汇编, C代码) 格式化为对话 Prompt。
-- 进行 QLoRA 微调，权重保存到 `model/sft_adapter/<版本>/`。
+- 遍历`VERSIONS`，从 SFT 数据集中按比例采样子集。
+- 将每个样本格式化为对话 Prompt。
+- 进行 QLoRA 微调，SFT 权重保存到 `model/sft_adapter/<版本>/`。
 
-### 3. 生成 DPO 数据
+### 4. 生成 DPO 数据
 
 ```bash
 python scripts/process_dpo_data.py
 ```
 
-- 加载 **基座模型 + SFT 适配器**。
-- 对每条训练样本，生成候选 C 代码。
-- **编译验证**：尝试编译每个候选代码。
-- **构造偏好对**：
-  - **Chosen (正例)**：原始数据集中正确的 C 代码。
-  - **Rejected (负例)**：SFT 模型基于正确 C 代码生成的 **错误/低质量** 代码（Bad Code Generation）。
-- 生成的 DPO 数据保存到 `data/dpo_data/<模型名>/<版本>/`。
+- 构造 DPO 数据集
+  - prompt : arch + 汇编代码
+  - chosen (正例) : 原始数据集中正确的 C 代码。
+  - rejected (负例) : 基座模型基于正确 C 代码生成的 **错误/低质量** 代码。
+- 生成的 DPO 数据保存到 `data/dpo_data/<train/valid>_data.jsonl`。
 
-### 4. DPO 对齐
+### 5. DPO 对齐
 
 **核心目标**：通过直接偏好优化 (Direct Preference Optimization)，抑制模型生成不可编译或低质量代码的倾向。
 
@@ -215,19 +224,19 @@ python scripts/process_dpo_data.py
 python scripts/train_dpo.py
 ```
 
-- 加载 **基座模型** 并 **合并 SFT 适配器** 作为新的基座。
-- 加载生成的 DPO 数据集。
-- 进行 DPO 微调，训练一个新的 DPO 适配器，权重保存到 `model/dpo_adapter/<版本>/`。
+- 遍历`VERSIONS`，从 DPO 数据集中按比例采样子集。
+- 加载 **基座模型** ，并 **合并 SFT 适配器** 作为新的基座。
+- 进行 QLoRA DPO 权重保存到 `model/dpo_adapter/<版本>/`。
 
-### 5. 模型评估
+### 6. 模型评估
 
 ```bash
 python scripts/evaluate.py
 ```
 
-- 加载 **基座模型**，同时挂载 **SFT 适配器** 和 **DPO 适配器**。
-- 在测试集上评估反编译成功率和语义等价性。
-- 结果保存到 `eval/<模型名>/<版本>.jsonl`。
+- 加载 **基座模型**，挂载 **DPO 适配器**。
+- 在测试集上评估反编译成功率和语义等性。
+- 结果保存到 `eval/<版本>.jsonl`。
 
 
 
