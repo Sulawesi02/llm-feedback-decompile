@@ -14,7 +14,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import (
     RAW_DATA_DIR, 
     PROCESSED_DATA_DIR, 
-    DEDUPLICATED_DATA_DIR,
+    DEDUP_DATA_DIR,
 )
 from src.utils import (
     compile_to_object,
@@ -147,12 +147,12 @@ def deduplicate_jsonl(input_path: Path, output_path: Path, field: str = "asm", n
 def main():
     RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    DEDUPLICATED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DEDUP_DATA_DIR.mkdir(parents=True, exist_ok=True)
     
     for split in SPLITS:
         split_dir = RAW_DATA_DIR / split
         processed_out_path = PROCESSED_DATA_DIR / f"{split}_data.jsonl"
-        deduplicated_out_path = DEDUPLICATED_DATA_DIR / f"{split}_data.jsonl"
+        deduplicated_out_path = DEDUP_DATA_DIR / f"{split}_data.jsonl"
 
         if processed_out_path.exists() and deduplicated_out_path.exists():
             print(f"\n{split} 的 data 文件已存在，跳过生成")
@@ -217,7 +217,7 @@ def main():
             print(f"{split} 去重完成: {before_num} -> {after_num}")
             print(f"去重后数据保存到: {deduplicated_out_path}")
         else:
-            print(f"\n{split} 的 deduplicated_data 文件已存在，跳过生成: {deduplicated_out_path}")
+            print(f"\n{split} 的 dedup_data 文件已存在，跳过生成: {deduplicated_out_path}")
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)

@@ -1,11 +1,14 @@
-import os
 import json
 import sys
 import re
-import time
 import shutil
+import gc
+import torch
 from pathlib import Path
+from typing import Optional
 from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 
 # 添加项目根目录到 sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -17,26 +20,35 @@ from src.config import (
     SFT_ADAPTER_DIR,
     DPO_ADAPTER_DIR,
     VERSIONS,
-    OFFLOAD_ROOT,
+    QUANT_CONFIG,
 )
 from src.utils import (
-    ModelRunning,
     machine_code_to_binary,
     disasm_binary,
     extract_asm,
-    clean_code_block,
     compile_to_object,
 )
 from src.prompts import (
     construct_infer_prompt,
     construct_fix_prompt,
-    construct_equivalence_prompt
+    construct_equal_prompt
 )
 
 MAX_SAMPLES = 200 # 最大样本数
 MAX_ITERS = 3 # 最大迭代次数
 
-model_runner = None
+_tokenizer = None
+_model = None
+
+def get_tokenizer(base_model_path: Path):
+    global _tokenizer
+    if _tokenizer is None:
+        print("加载分词器...")
+        _tokenizer = AutoTokenizer.from_pretrained(str(base_model_path), trust_remote_code=True)
+        _tokenizer.pad_token = _tokenizer.eos_token
+        _tokenizer.padding_side = "right"
+        _tokenizer.truncation_side = "right"
+    return _tokenizer
 
 def evaluate_single_task(sample_index: int, task: dict):
     """
@@ -50,16 +62,13 @@ def evaluate_single_task(sample_index: int, task: dict):
     print(f"开始评估: 样本 {sample_index} | 架构: {arch}")
     print(f"{'='*50}")
 
-    generate_c_code = None
-    previous_c_code = None
+    outputs = None
+    previous_outputs = None
     last_error = None
     
     history = []
-    best_c_code = None
+    best_outputs = None
     
-    start_time = time.time()
-    TOTAL_TIMEOUT = 120.0
-
     for it in range(MAX_ITERS):
         print(f"\n--- 迭代 {it+1}/{MAX_ITERS} ---")
         
@@ -74,32 +83,61 @@ def evaluate_single_task(sample_index: int, task: dict):
                 messages = construct_infer_prompt(arch, asm)
             else:
                 print("构造修复提示...")
-                messages = construct_fix_prompt(arch, asm, previous_c_code, last_error)
+                messages = construct_fix_prompt(arch, asm, previous_outputs, last_error)
             
-            run_time = time.time() - start_time
-            remaining_time = TOTAL_TIMEOUT - run_time
+            gen_inputs = _tokenizer.apply_chat_template(
+                messages, 
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            ).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
             print("生成 C 函数代码...")
-            generate_c_code = model_runner.generate(messages, remaining_time)
-            generate_c_code = clean_code_block(generate_c_code)
+            with torch.no_grad():
+                gen_outputs = _model.generate(
+                    gen_inputs,
+                    max_new_tokens=512,
+                    temperature=0.7,
+                    top_p=0.95,
+                    do_sample=True,
+                    eos_token_id=_tokenizer.eos_token_id,
+                    pad_token_id=_tokenizer.pad_token_id,
+                )
+            gen_outputs = _tokenizer.decode(gen_outputs[0], skip_special_tokens=True).split("assistant\n")[-1]
 
             print("编译 C 函数代码...")
-            success, error_msg, o_path = compile_to_object(arch, generate_c_code)
-            
+            success, error_msg, o_path = compile_to_object(arch, gen_outputs)
             if success:
                 print("编译成功，进行语义等价性判定...")
                 
-                eval_messages = construct_equivalence_prompt(c_code, generate_c_code)
-                judgment = model_runner.generate(eval_messages, remaining_time=30.0)
-                judgment = judgment.strip()
+                eval_messages = construct_equal_prompt(c_code, gen_outputs)
+                eq_inputs = _tokenizer.apply_chat_template(
+                    eval_messages, 
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=512,
+                ).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+                
+                with torch.no_grad():
+                    eq_outputs = _model.generate(
+                        eq_inputs,
+                        max_new_tokens=512,
+                        temperature=0.7,
+                        top_p=0.95,
+                        do_sample=True,
+                        eos_token_id=_tokenizer.eos_token_id,
+                        pad_token_id=_tokenizer.pad_token_id,
+                    )
+                judgment = _tokenizer.decode(eq_outputs[0], skip_special_tokens=True).split("assistant\n")[-1]
                 judgment = re.sub(r'[^0-1]', '', judgment)
                 
                 if judgment == "0":
                     print("判定通过：语义等价")
-                    best_c_code = generate_c_code
+                    best_outputs = gen_outputs
                     history.append({
                         "iter": it,
                         "success": True,
-                        "generate_c_code": generate_c_code,
+                        "outputs": gen_outputs,
                         "error": "",
                     })
                     break
@@ -109,11 +147,10 @@ def evaluate_single_task(sample_index: int, task: dict):
                     history.append({
                         "iter": it,
                         "success": False,
-                        "generate_c_code": generate_c_code,
+                        "outputs": gen_outputs,
                         "error": error_msg,
                     })
                     break
-
             else:   
                 error_msg = error_msg[:1000]
                 print(f"编译失败: {error_msg.splitlines()[0] if error_msg else 'Unknown'}...")
@@ -121,11 +158,11 @@ def evaluate_single_task(sample_index: int, task: dict):
                     {
                         "iter": it,
                         "success": False,
-                        "generate_c_code": generate_c_code,
+                        "outputs": outputs,
                         "error": error_msg,
                     }
                 )
-                previous_c_code = generate_c_code
+                previous_outputs = outputs
                 last_error = error_msg
                 continue
         except Exception as e:
@@ -133,7 +170,7 @@ def evaluate_single_task(sample_index: int, task: dict):
             history.append({
                 "iter": it,
                 "success": False,
-                "generate_c_code": "",
+                "outputs": "",
                 "error": f"生成 C 函数代码出错: {e}",
             })
             break
@@ -143,83 +180,96 @@ def evaluate_single_task(sample_index: int, task: dict):
                 if workdir and workdir.exists():
                     shutil.rmtree(workdir, ignore_errors=True)
 
-    print(f"任务结束 | 最终状态: {'成功' if best_c_code else '失败'}")
+    print(f"任务结束 | 最终状态: {'成功' if best_outputs else '失败'}")
     result_entry = {
         "id": f"{sample_index}_{task['id_suffix']}",
         "arch": arch,
-        "success": best_c_code is not None,
+        "success": best_outputs is not None,
         "machine_code": task["machine_code"],
         "c_code": task["c_code"],
-        "best_c_code": best_c_code,
+        "best_outputs": best_outputs,
         "history": history,
     }
     return result_entry
 
-def evaluate_model(base_model_path: Path, sft_adapter_path: Path, dpo_adapter_path: Path, version: str, eval_out_dir: Path):
-    eval_out_path = eval_out_dir / f"{version}.jsonl"
+def evaluate_model(base_model_path: Path, dpo_adapter_path: Optional[Path], eval_out_path: Path):
     
-    global model_runner
+    global _tokenizer, _model
     
-    offload_dir = OFFLOAD_ROOT / "evaluate"
-    offload_dir.mkdir(parents=True, exist_ok=True)
-
-    model_runner = ModelRunning(
-        base_model_path=str(base_model_path),
-        sft_adapter_path=str(sft_adapter_path),
-        dpo_adapter_path=str(dpo_adapter_path),
-        offload_folder=str(offload_dir),
-        offload_buffers=False
+    print("加载分词器...")
+    _tokenizer = get_tokenizer(base_model_path)
+    
+    print("加载模型...")
+    _model = AutoModelForCausalLM.from_pretrained(
+        str(base_model_path),
+        trust_remote_code=True,
+        quantization_config=QUANT_CONFIG,
+        device_map={"": "cuda:0"},
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
     )
+
+    if dpo_adapter_path:
+        print(f"加载 DPO 适配器: {dpo_adapter_path}")
+        _model = PeftModel.from_pretrained(
+            _model,
+            str(dpo_adapter_path),
+            device_map={"": "cuda:0"},
+        )
+    else:
+        print("未提供适配器路径，使用基座模型进行评估")
+
+    _model.eval() # 推理模式
 
     results = []
     success_count = 0
     total_count = 0
 
-    try:
-        with open(TEST_DATA, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+    with open(TEST_DATA, "r", encoding="utf-8") as f:
+        lines = f.readlines()
 
-        lines = lines[:MAX_SAMPLES]
+    lines = lines[:MAX_SAMPLES]
 
-        for i, line in tqdm(enumerate(lines), total=len(lines), desc="评估进度"):
-            try:
-                data = json.loads(line)
-                tasks = []
-                for arch, arch_data in data["compilations"].items():
-                    tasks.append(
-                        {
-                            "arch": arch,
-                            "machine_code": arch_data.get("machine_code"),
-                            "c_code": data.get("c_code"),
-                            "id_suffix": arch,
-                        }
-                    )
+    for i, line in tqdm(enumerate(lines), total=len(lines), desc="评估进度"):
+        try:
+            data = json.loads(line)
+            tasks = []
+            for arch, arch_data in data["compilations"].items():
+                tasks.append(
+                    {
+                        "arch": arch,
+                        "machine_code": arch_data.get("machine_code"),
+                        "c_code": data.get("c_code"),
+                        "id_suffix": arch,
+                    }
+                )
 
-                for task in tasks:
-                    result_entry = evaluate_single_task(i, task)
-                    results.append(result_entry)
-                    if result_entry["success"]:
-                        success_count += 1
-                    total_count += 1
+            for task in tasks:
+                result_entry = evaluate_single_task(i, task)
+                results.append(result_entry)
+                if result_entry["success"]:
+                    success_count += 1
+                total_count += 1
 
-            except json.JSONDecodeError:
-                continue
-            except Exception as e:
-                print(f"处理样本 {i} 时出错: {e}")
-                continue
-
-    finally:
-        model_runner.unload()
+        except json.JSONDecodeError:
+            continue
+        except Exception as e:
+            print(f"处理样本 {i} 时出错: {e}")
+            continue
 
     Path(eval_out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(eval_out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
     accuracy = success_count / total_count if total_count > 0 else 0
-    print(f"\n评估完成: {version}")
     print(f"总样本数: {total_count}")
     print(f"成功编译数: {success_count}")
     print(f"编译通过率: {accuracy:.2%}")
+
+    # 清理资源
+    del _model
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def main():
     if not TEST_DATA.exists():
@@ -240,10 +290,26 @@ def main():
         print(f"错误: 版本号未配置")
         return
     
-    eval_out_dir = EVAL_DIR / MODEL_NAME
-    eval_out_dir.mkdir(parents=True, exist_ok=True)
-    
+    # 1. 评估基座模型
+    base_eval_out = EVAL_DIR / "base_model.jsonl"
+    if base_eval_out.exists():
+        print("基座模型评估结果已存在，跳过")
+    else:
+        print(f"\n{'='*20} 开始评估基座模型 {'='*20}")
+        try:
+            evaluate_model(base_model_path, None, base_eval_out)
+        except Exception as e:
+            print(f"基座模型评估失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # 2. 评估各个版本
     for version, _ in VERSIONS:
+        eval_out_path = EVAL_DIR / f"{version}.jsonl"
+        if eval_out_path.exists():
+            print(f"({version} 版本) 评估结果已存在，跳过")
+            continue
+        
         sft_adapter_path = SFT_ADAPTER_DIR / version
         if not sft_adapter_path.exists():
             print(f"错误: SFT 适配器不存在: {sft_adapter_path}")
@@ -254,7 +320,7 @@ def main():
             continue
             
         try:
-            evaluate_model(base_model_path, sft_adapter_path, dpo_adapter_path, version, eval_out_dir)
+            evaluate_model(base_model_path, dpo_adapter_path, eval_out_path)
         except Exception as e:
             print(f"{version} 版本模型评估失败: {e}")
 

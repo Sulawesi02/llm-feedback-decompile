@@ -1,26 +1,26 @@
 import uvicorn
-import time
+import torch
 import shutil
+import gc
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pathlib import Path
 from contextlib import asynccontextmanager
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 
 from config import (
     MODEL_NAME,
     BASE_MODEL_DIR, 
-    SFT_ADAPTER_DIR,
     DPO_ADAPTER_DIR,
     VERSIONS, 
-    OFFLOAD_ROOT,
+    QUANT_CONFIG,
 )
-from utils import (
-    ModelRunning,    
+from utils import ( 
     machine_code_to_binary,
     disasm_binary,
     extract_asm,
-    clean_code_block,
     compile_to_object,
 )
 from src.prompts import construct_infer_prompt, construct_fix_prompt
@@ -29,31 +29,43 @@ VERSION = VERSIONS[2][0] # 版本号
 
 MAX_ITERS = 3 # 最大迭代次数
 
-model_runner = None
+tokenizer = None
+model = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     base_model_path = BASE_MODEL_DIR / MODEL_NAME
-    sft_adapter_path = SFT_ADAPTER_DIR / VERSION
     dpo_adapter_path = DPO_ADAPTER_DIR / VERSION
 
-    global model_runner
+    global tokenizer, model
     
-    offload_dir = OFFLOAD_ROOT / "app"
-    offload_dir.mkdir(parents=True, exist_ok=True)
+    print("加载分词器...")
+    tokenizer = AutoTokenizer.from_pretrained(str(base_model_path), trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+    tokenizer.truncation_side = "right"
     
-    model_runner = ModelRunning(
-        base_model_path=str(base_model_path),
-        sft_adapter_path=str(sft_adapter_path),
-        dpo_adapter_path=str(dpo_adapter_path),
-        offload_folder=str(offload_dir),
-        offload_buffers=False
+    print("加载模型...")
+    model = PeftModel.from_pretrained(
+        AutoModelForCausalLM.from_pretrained(
+            str(base_model_path),
+            trust_remote_code=True,
+            quantization_config=QUANT_CONFIG,
+            device_map={"": "cuda:0"},
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        ),
+        str(dpo_adapter_path),
+        device_map={"": "cuda:0"},
     )
+    model.eval() # 推理模式
     try:
         yield
     finally:
-        if model_runner:
-            model_runner.unload()
+        # 清理资源
+        del model, tokenizer
+        gc.collect()
+        torch.cuda.empty_cache()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -69,16 +81,13 @@ async def decompile(request: DecompileRequest):
     arch = request.arch
     machine_code = request.machine_code
 
-    generate_c_code = None
-    previous_c_code = None
+    outputs = None
+    previous_outputs = None
     last_error = None
     
     history = []
-    best_c_code = None
+    best_outputs = None
     
-    start_time = time.time()
-    TOTAL_TIMEOUT = 120.0
-
     for it in range(MAX_ITERS):
         print(f"\n--- 迭代 {it+1}/{MAX_ITERS} ---")
         
@@ -93,23 +102,37 @@ async def decompile(request: DecompileRequest):
                 messages = construct_infer_prompt(arch, asm)
             else:
                 print("构造修复提示...")
-                messages = construct_fix_prompt(arch, asm, previous_c_code, last_error)
+                messages = construct_fix_prompt(arch, asm, previous_outputs, last_error)
             
-            run_time = time.time() - start_time
-            remaining_time = TOTAL_TIMEOUT - run_time
+            inputs = tokenizer.apply_chat_template(
+                messages, 
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            ).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
             print("生成 C 函数代码...")
-            generate_c_code = model_runner.generate(messages, remaining_time)
-            generate_c_code = clean_code_block(generate_c_code)
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs, 
+                    max_new_tokens=512,
+                    temperature=0.7,
+                    top_p=0.95,
+                    do_sample=True,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            outputs = tokenizer.decode(outputs[0], skip_special_tokens=True).split("assistant\n")[-1]
 
             print("编译 C 函数代码...")
-            success, error_msg, o_path = compile_to_object(arch, generate_c_code)
+            success, error_msg, o_path = compile_to_object(arch, outputs)
             if success:
-                print("编译成功。")
-                best_c_code = generate_c_code
+                print("编译成功")
+                best_outputs = outputs
                 history.append({
                     "iter": it,
                     "success": True,
-                    "generate_c_code": generate_c_code,
+                    "outputs": outputs,
                     "error": "",
                 })
                 break
@@ -120,11 +143,11 @@ async def decompile(request: DecompileRequest):
                     {
                         "iter": it,
                         "success": False,
-                        "generate_c_code": generate_c_code,
+                        "outputs": outputs,
                         "error": error_msg,
                     }
                 )
-                previous_c_code = generate_c_code
+                previous_outputs = outputs
                 last_error = error_msg
                 continue
         except Exception as e:
@@ -132,7 +155,7 @@ async def decompile(request: DecompileRequest):
             history.append({
                 "iter": it,
                 "success": False,
-                "generate_c_code": "",
+                "outputs": "",
                 "error": f"生成 C 函数代码出错: {e}",
             })
             break
@@ -142,8 +165,8 @@ async def decompile(request: DecompileRequest):
                 if workdir and workdir.exists():
                     shutil.rmtree(workdir, ignore_errors=True)
     
-    print(f"任务结束 | 最终状态: {'成功' if best_c_code else '失败'}")
-    return {"best_c_code": best_c_code} 
+    print(f"任务结束 | 最终状态: {'成功' if best_outputs else '失败'}")
+    return {"best_outputs": best_outputs} 
 
 # 静态文件服务
 STATIC_DIR = Path(__file__).resolve().parent / "static"

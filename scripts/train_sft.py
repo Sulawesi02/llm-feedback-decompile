@@ -2,150 +2,137 @@ import sys
 import torch
 import gc
 from pathlib import Path
-from peft import LoraConfig, prepare_model_for_kbit_training, TaskType
 from trl import SFTTrainer, SFTConfig
-from datasets import DatasetDict, load_dataset
-from transformers import DataCollatorForSeq2Seq
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import prepare_model_for_kbit_training, get_peft_model
 
 # 添加项目根目录到 sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import (
-    TRAIN_DATA, 
-    VALID_DATA,
+    SFT_DATA_DIR,
     MODEL_NAME,
     BASE_MODEL_DIR, 
     SFT_ADAPTER_DIR, 
     VERSIONS,
+    QUANT_CONFIG,
+    LORA_CONFIG,
 )
-from src.utils import (
-    ModelRunning, 
-    extract_compilation_data,
-)
-from src.prompts import construct_train_prompt
 
-def format_data(examples, tokenizer):
-    """ 将样本转换为 SFTTrainer 需要的格式 (text list) """
-    texts = []
-    try:
-        batch_size = len(examples["c_code"])
-        
-        for i in range(batch_size):
-            item = {
-                "c_code": examples["c_code"][i],
-                "compilations": examples["compilations"][i]
-            }
-            
-            for arch, asm, c_code, _ in extract_compilation_data(item):
-                messages = construct_train_prompt(arch, asm, c_code)
-                text = tokenizer.apply_chat_template(messages, tokenize=False)
-                texts.append(text)
-        
-        return {"text": texts}
-        
-    except Exception as e:
-        print(f"格式化过程中出错: {e}")
-        return {"text": []}
+_tokenizer = None
 
-def train_sft(base_model_path, ratio, sft_adapter_path):
-    print("加载基座模型和分词器...")
-    model_running = ModelRunning(base_model_path=str(base_model_path))
-    model = model_running.model
-    tokenizer = model_running.tokenizer
+def get_tokenizer(base_model_path: Path) -> AutoTokenizer:
+    """获取或创建tokenizer（单例模式）"""
+    global _tokenizer
+    
+    if _tokenizer is None:
+        print("初始化分词器...")
+        _tokenizer = AutoTokenizer.from_pretrained(str(base_model_path), trust_remote_code=True)
+        _tokenizer.pad_token = _tokenizer.eos_token
+        _tokenizer.padding_side = "right"
+        _tokenizer.truncation_side = "right"
+    
+    return _tokenizer
 
-    # 准备模型用于 k-bit 训练
-    model = prepare_model_for_kbit_training(model)
-
-    print("配置 LoRA...")
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj"],
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-        use_rslora=True,
+def format_sft_data(example):
+    """
+    格式化 SFT 数据项
+    """
+    messages = [
+        {"role": "user", "content": example["instruction"]},
+        {"role": "assistant", "content": example["outputs"]},
+    ]
+    text = _tokenizer.apply_chat_template(
+        messages, 
+        tokenize=False, 
+        add_generation_prompt=False,
+        return_dict=False,
     )
+    return {"text": text}
 
-    training_args = SFTConfig(
+def train_sft(base_model_path, sft_adapter_path, ratio):
+    print("加载分词器...")
+    _tokenizer = get_tokenizer(base_model_path)
+    
+    print("加载模型...")
+    model = AutoModelForCausalLM.from_pretrained(
+        str(base_model_path),
+        trust_remote_code=True,
+        quantization_config=QUANT_CONFIG,
+        device_map={"": "cuda"},
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    )
+    
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    model = get_peft_model(model, LORA_CONFIG) # 绑定 LoRA
+    model.print_trainable_parameters() # 打印可训练参数
+    
+    sft_args = SFTConfig(
         output_dir=str(sft_adapter_path),
-        per_device_train_batch_size=1,      # 每个设备的 batch size
+        per_device_train_batch_size=1,      # 每个设备的训练 batch size
+        per_device_eval_batch_size=1,       # 每个设备的验证 batch size
         gradient_accumulation_steps=8,      # 梯度累积步数，模拟更大的 batch size
         learning_rate=3e-4,                 # 学习率
         num_train_epochs=3,                 # 训练轮数
-        bf16=True,                          # 使用 bfloat16 精度 (推荐 Ampere+ GPU)
-        fp16=False,
-        optim="paged_adamw_8bit",           # 使用 8-bit 优化器节省显存
-        gradient_checkpointing=True,        # 梯度检查点，节省显存但通过重计算换取时间
-        logging_steps=20,                   # 每隔多少步打印日志
-        eval_strategy="steps",              # 评估策略：按步数
-        eval_steps=100,                     # 每隔多少步评估一次
-        save_strategy="steps",              # 保存策略：按步数
-        save_steps=100,                     # 每隔多少步保存一次
-        load_best_model_at_end=True,        # 训练结束加载最好的模型
-        metric_for_best_model="loss",       # 根据 loss 选择最好的模型
+        logging_steps=10,                   # 打印日志频率
+        save_steps=100,                     # 保存模型检查点频率
+        eval_steps=100,                     # 评估模型频率
+        evaluation_strategy="steps",        # 评估策略
+        load_best_model_at_end=True,        # 训练结束后加载最优模型
+        metric_for_best_model="eval_loss",  # 用于选择最优模型的指标
+        fp16=torch.cuda.is_available(),     # 使用 float16 精度
+        warmup_ratio=0.1,                   # 预热比例
+        weight_decay=0.01,                  # 权重衰减
         report_to=[],                       # 不上报到 wandb 等平台
-        disable_tqdm=False,
-        dataloader_num_workers=0,
-        ddp_find_unused_parameters=False,
-        remove_unused_columns=False,        # SFT 必须保留 dataset_text_field 列，否则无法计算 loss
-        
-        # SFT 特有参数
-        dataset_text_field="text",          # 数据集中包含训练文本的列名
-        max_seq_length=2048,                # 单个样本的最大 Token 长度 (Prompt + Response)
-        packing=False,                      # 是否开启 packing (将多个短样本拼接，提高训练效率，但可能影响收敛)
+        gradient_checkpointing=True,        # 启用梯度检查点
+        gradient_checkpointing_kwargs={"use_reentrant": False},# 设置非重入模式
+        optim="adamw_8bit",                 # 使用8位优化器
+        group_by_length=False,              # 按长度分组
     )
     
-    print("加载数据集...")
-    raw_train = load_dataset("json", data_files=str(TRAIN_DATA), split="train")
-    raw_valid = load_dataset("json", data_files=str(VALID_DATA), split="train")
-    print(f"原始训练数据: {len(raw_train)} 条, 验证数据: {len(raw_valid)} 条")
+    print(f"加载数据集...")
+    raw_train = load_dataset("json", data_files=str(SFT_DATA_DIR / "train_data.jsonl"), split="train")
+    raw_valid = load_dataset("json", data_files=str(SFT_DATA_DIR / "valid_data.jsonl"), split="train")
+    print(f"原始训练数据: {len(raw_train)} 条")
+    print(f"原始验证数据: {len(raw_valid)} 条")
     
+    print(f"采样数据集...")
     sampled_train = raw_train.shuffle(seed=42).select(range(int(len(raw_train) * ratio)))
     sampled_valid = raw_valid.shuffle(seed=42).select(range(int(len(raw_valid) * ratio)))
-    print(f"采样后训练数据: {len(sampled_train)} 条, 验证数据: {len(sampled_valid)} 条")
+    print(f"采样训练数据: {len(sampled_train)} 条")
+    print(f"采样验证数据: {len(sampled_valid)} 条")
     
-    data = DatasetDict({
-        "train": sampled_train,
-        "valid": sampled_valid
-    })
+    print(f"格式化数据集...")
+    sampled_train = sampled_train.map(format_sft_data)
+    sampled_valid = sampled_valid.map(format_sft_data)
     
-    print("数据预处理...")
-    remove_columns = data["train"].column_names
-    processed_dataset = data.map(
-        lambda x: format_data(x, tokenizer),
-        batched=True,
-        remove_columns=remove_columns,
-        desc="Formatting dataset"
-    )
-
     trainer = SFTTrainer(
         model=model,
-        args=training_args,
-        train_dataset=processed_dataset["train"],
-        eval_dataset=processed_dataset["valid"] if "valid" in processed_dataset else None,
-        tokenizer=tokenizer,
-        peft_config=lora_config,
-        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True), # SFTTrainer 默认有 collator，但也可以指定
+        train_dataset=sampled_train,
+        eval_dataset=sampled_valid,
+        peft_config=LORA_CONFIG,
+        dataset_text_field="text",
+        max_seq_length=512,
+        tokenizer=_tokenizer,
+        args=sft_args,
+        packing=False,
     )
 
     print(f"开始 SFT 训练...")
     trainer.train()
 
-    print(f"保存 LoRA 适配器到 {sft_adapter_path}")
-    model.save_pretrained(sft_adapter_path)
-    tokenizer.save_pretrained(sft_adapter_path)
+    print(f"保存 LoRA 适配器...")
+    trainer.save_model(sft_adapter_path)
     
-    # 清理训练资源
+    # 清理资源
     del model, trainer
-    torch.cuda.empty_cache()
     gc.collect()
-    
+    torch.cuda.empty_cache()
+
 def main():
-    if not TRAIN_DATA.exists():
-        print(f"错误: 训练集不存在: {TRAIN_DATA}")
-        return
-    if not VALID_DATA.exists():
-        print(f"错误: 验证集不存在: {VALID_DATA}")
+    if not SFT_DATA_DIR.exists():
+        print(f"错误: SFT 数据目录不存在: {SFT_DATA_DIR}")
         return
     if not MODEL_NAME:
         print("错误: 模型名称未配置")
@@ -157,6 +144,7 @@ def main():
     if not base_model_path.exists():
         print(f"错误: 基座模型不存在: {base_model_path}")
         return
+    
     SFT_ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
     if not VERSIONS:
         print(f"错误: 版本号未配置")
@@ -173,9 +161,11 @@ def main():
             sft_adapter_path.mkdir(parents=True, exist_ok=True)
             print(f"\n{'='*20} 开始训练 ({version} 版本) SFT 适配器 (数据比例: {ratio}) {'='*20}")
             try:
-                train_sft(base_model_path, ratio, sft_adapter_path)
+                train_sft(base_model_path, sft_adapter_path, ratio)
             except Exception as e:
                 print(f"({version} 版本) SFT 适配器训练失败: {e}")
+                import traceback
+                traceback.print_exc()
                 break
 
 if __name__ == "__main__":
