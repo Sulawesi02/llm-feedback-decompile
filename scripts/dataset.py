@@ -16,6 +16,8 @@ from src.config import RAW_DATA_DIR
 # 数据集配置
 DATASET_REPO_ID = "jordiae/exebench"
 
+SPLITS = ["train", "valid", "test"]
+
 def download_dataset(local_dir: Path, max_retries=10):
     """
     下载 ExeBench 数据集，支持自动重试
@@ -26,7 +28,6 @@ def download_dataset(local_dir: Path, max_retries=10):
     for i in range(max_retries):
         try:
             print(f"\n[{i+1}/{max_retries}] 开始下载数据集文件...")
-            # 使用 snapshot_download 下载指定文件
             # allow_patterns 只下载我们需要的那 6 个文件
             path = snapshot_download(
                 repo_id=DATASET_REPO_ID,
@@ -63,7 +64,7 @@ def unzip_dataset(base_dir: Path):
 
     # 1. 创建目录结构
     print("1. 创建目录结构 (train, valid, test)...")
-    for d in ["train", "valid", "test"]:
+    for d in SPLITS:
         (base_dir / d).mkdir(parents=True, exist_ok=True)
 
     # 2. 解压 .tar.gz 文件
@@ -81,7 +82,6 @@ def unzip_dataset(base_dir: Path):
                 print(f"  正在解压 {file_name} 到 {category}/ ...")
                 try:
                     with tarfile.open(file_path, "r:gz") as tar:
-                        # 模拟 --strip-components=1
                         for member in tar.getmembers():
                             if '/' in member.name:
                                 member.name = member.name.split('/', 1)[1]

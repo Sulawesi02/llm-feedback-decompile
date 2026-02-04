@@ -2,13 +2,14 @@ import json
 import sys
 import re
 import shutil
-import gc
 import torch
+import gc
 from pathlib import Path
 from typing import Optional
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
+from datasets import load_dataset
 
 # 添加项目根目录到 sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -23,10 +24,8 @@ from src.config import (
     QUANT_CONFIG,
 )
 from src.utils import (
-    machine_code_to_binary,
-    disasm_binary,
-    extract_asm,
-    compile_to_object,
+    extract_data, 
+    compile_to_obj,
 )
 from src.prompts import (
     construct_infer_prompt,
@@ -50,19 +49,12 @@ def get_tokenizer(base_model_path: Path):
         _tokenizer.truncation_side = "right"
     return _tokenizer
 
-def evaluate_single_task(sample_index: int, task: dict):
+def process_single_sample(c_code: str, arch: str, asm: str, machine_code: str):
     """
-    评估单个任务
+    处理单条样本
     """
-    arch = task["arch"]
-    machine_code = task["machine_code"]
-    c_code = task["c_code"]
-    
-    print(f"\n{'='*50}")
-    print(f"开始评估: 样本 {sample_index} | 架构: {arch}")
-    print(f"{'='*50}")
-
-    outputs = None
+    print(f"输入 C 代码:\n{c_code}")
+    gen_outputs = None
     previous_outputs = None
     last_error = None
     
@@ -74,53 +66,41 @@ def evaluate_single_task(sample_index: int, task: dict):
         
         o_path = None
         try:
-            binary_path = machine_code_to_binary(machine_code)            
-            disasm_result = disasm_binary(arch, binary_path)
-            asm = extract_asm(arch, disasm_result)
-
             if it == 0:
                 print("构造推理提示...")
                 messages = construct_infer_prompt(arch, asm)
             else:
                 print("构造修复提示...")
                 messages = construct_fix_prompt(arch, asm, previous_outputs, last_error)
-            
-            gen_inputs = _tokenizer.apply_chat_template(
-                messages, 
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
-            ).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+            text = _tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            gen_inputs = _tokenizer(text, return_tensors="pt", truncation=True, max_length=4096).to(_model.device)
 
             print("生成 C 函数代码...")
             with torch.no_grad():
                 gen_outputs = _model.generate(
-                    gen_inputs,
-                    max_new_tokens=512,
+                    **gen_inputs,
+                    max_new_tokens=1024,
                     temperature=0.7,
                     top_p=0.95,
                     do_sample=True,
                     eos_token_id=_tokenizer.eos_token_id,
                     pad_token_id=_tokenizer.pad_token_id,
                 )
-            gen_outputs = _tokenizer.decode(gen_outputs[0], skip_special_tokens=True).split("assistant\n")[-1]
+            gen_outputs = _tokenizer.decode(gen_outputs[0][gen_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("```c", "").replace("```", "").strip()
+            print(f"生成的 C 函数代码:\n{gen_outputs}")
 
             print("编译 C 函数代码...")
-            success, error_msg, o_path = compile_to_object(arch, gen_outputs)
+            success, error_msg, o_path = compile_to_obj(arch, gen_outputs)
             if success:
                 print("编译成功，进行语义等价性判定...")
                 
-                eval_messages = construct_equal_prompt(c_code, gen_outputs)
-                eq_inputs = _tokenizer.apply_chat_template(
-                    eval_messages, 
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=512,
-                ).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+                messages = construct_equal_prompt(c_code, gen_outputs)
+                text = _tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                eq_inputs = _tokenizer(text, return_tensors="pt", truncation=True, max_length=4096).to(_model.device)
                 
                 with torch.no_grad():
                     eq_outputs = _model.generate(
-                        eq_inputs,
+                        **eq_inputs,
                         max_new_tokens=512,
                         temperature=0.7,
                         top_p=0.95,
@@ -128,10 +108,10 @@ def evaluate_single_task(sample_index: int, task: dict):
                         eos_token_id=_tokenizer.eos_token_id,
                         pad_token_id=_tokenizer.pad_token_id,
                     )
-                judgment = _tokenizer.decode(eq_outputs[0], skip_special_tokens=True).split("assistant\n")[-1]
-                judgment = re.sub(r'[^0-1]', '', judgment)
+                eq_outputs = _tokenizer.decode(eq_outputs[0][eq_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("```c", "").replace("```", "").strip()
+                print(f"语义等价性判定结果: {eq_outputs}")
                 
-                if judgment == "0":
+                if eq_outputs == "0":
                     print("判定通过：语义等价")
                     best_outputs = gen_outputs
                     history.append({
@@ -150,7 +130,9 @@ def evaluate_single_task(sample_index: int, task: dict):
                         "outputs": gen_outputs,
                         "error": error_msg,
                     })
-                    break
+                    previous_outputs = gen_outputs
+                    last_error = error_msg
+                    continue
             else:   
                 error_msg = error_msg[:1000]
                 print(f"编译失败: {error_msg.splitlines()[0] if error_msg else 'Unknown'}...")
@@ -158,11 +140,11 @@ def evaluate_single_task(sample_index: int, task: dict):
                     {
                         "iter": it,
                         "success": False,
-                        "outputs": outputs,
+                        "outputs": gen_outputs,
                         "error": error_msg,
                     }
                 )
-                previous_outputs = outputs
+                previous_outputs = gen_outputs
                 last_error = error_msg
                 continue
         except Exception as e:
@@ -182,11 +164,11 @@ def evaluate_single_task(sample_index: int, task: dict):
 
     print(f"任务结束 | 最终状态: {'成功' if best_outputs else '失败'}")
     result_entry = {
-        "id": f"{sample_index}_{task['id_suffix']}",
+        "c_code": c_code,
         "arch": arch,
+        "asm": asm,
+        "machine_code": machine_code,
         "success": best_outputs is not None,
-        "machine_code": task["machine_code"],
-        "c_code": task["c_code"],
         "best_outputs": best_outputs,
         "history": history,
     }
@@ -204,60 +186,34 @@ def evaluate_model(base_model_path: Path, dpo_adapter_path: Optional[Path], eval
         str(base_model_path),
         trust_remote_code=True,
         quantization_config=QUANT_CONFIG,
-        device_map={"": "cuda:0"},
+        device_map={"": torch.cuda.current_device()},
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
-
     if dpo_adapter_path:
         print(f"加载 DPO 适配器: {dpo_adapter_path}")
         _model = PeftModel.from_pretrained(
             _model,
             str(dpo_adapter_path),
-            device_map={"": "cuda:0"},
+            device_map={"": torch.cuda.current_device()},
         )
-    else:
-        print("未提供适配器路径，使用基座模型进行评估")
-
     _model.eval() # 推理模式
 
     results = []
     success_count = 0
     total_count = 0
 
-    with open(TEST_DATA, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    raw_test = load_dataset("json", data_files=str(TEST_DATA), split="train")
+    sampled_test = raw_test.select(range(MAX_SAMPLES))
 
-    lines = lines[:MAX_SAMPLES]
+    for item in tqdm(sampled_test, desc="评估进度"):
+        for c_code, arch, asm, machine_code in extract_data(item):
+            result_entry = process_single_sample(c_code, arch, asm, machine_code)
+            results.append(result_entry)
+            if result_entry.get("success"):
+                success_count += 1
+            total_count += 1
 
-    for i, line in tqdm(enumerate(lines), total=len(lines), desc="评估进度"):
-        try:
-            data = json.loads(line)
-            tasks = []
-            for arch, arch_data in data["compilations"].items():
-                tasks.append(
-                    {
-                        "arch": arch,
-                        "machine_code": arch_data.get("machine_code"),
-                        "c_code": data.get("c_code"),
-                        "id_suffix": arch,
-                    }
-                )
-
-            for task in tasks:
-                result_entry = evaluate_single_task(i, task)
-                results.append(result_entry)
-                if result_entry["success"]:
-                    success_count += 1
-                total_count += 1
-
-        except json.JSONDecodeError:
-            continue
-        except Exception as e:
-            print(f"处理样本 {i} 时出错: {e}")
-            continue
-
-    Path(eval_out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(eval_out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
@@ -300,8 +256,6 @@ def main():
             evaluate_model(base_model_path, None, base_eval_out)
         except Exception as e:
             print(f"基座模型评估失败: {e}")
-            import traceback
-            traceback.print_exc()
 
     # 2. 评估各个版本
     for version, _ in VERSIONS:
@@ -318,7 +272,7 @@ def main():
         if not dpo_adapter_path.exists():
             print(f"错误: DPO 适配器不存在: {dpo_adapter_path}")
             continue
-            
+        print(f"\n{'='*20} 开始评估 ({version} 版本) {'='*20}")
         try:
             evaluate_model(base_model_path, dpo_adapter_path, eval_out_path)
         except Exception as e:

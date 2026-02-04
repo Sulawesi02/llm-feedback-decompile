@@ -5,6 +5,7 @@ from pathlib import Path
 from trl import SFTTrainer, SFTConfig
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.trainer_utils import get_last_checkpoint
 from peft import prepare_model_for_kbit_training, get_peft_model
 
 # 添加项目根目录到 sys.path
@@ -39,8 +40,8 @@ def format_sft_data(example):
     格式化 SFT 数据项
     """
     messages = [
-        {"role": "user", "content": example["instruction"]},
-        {"role": "assistant", "content": example["outputs"]},
+        {"role": "system", "content": example.get("instruction", "")},
+        {"role": "user", "content": example.get("outputs", "")},
     ]
     text = _tokenizer.apply_chat_template(
         messages, 
@@ -59,11 +60,12 @@ def train_sft(base_model_path, sft_adapter_path, ratio):
         str(base_model_path),
         trust_remote_code=True,
         quantization_config=QUANT_CONFIG,
-        device_map={"": "cuda"},
+        device_map={"": torch.cuda.current_device()},
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
     
+    model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     model = get_peft_model(model, LORA_CONFIG) # 绑定 LoRA
     model.print_trainable_parameters() # 打印可训练参数
@@ -78,17 +80,20 @@ def train_sft(base_model_path, sft_adapter_path, ratio):
         logging_steps=10,                   # 打印日志频率
         save_steps=100,                     # 保存模型检查点频率
         eval_steps=100,                     # 评估模型频率
-        evaluation_strategy="steps",        # 评估策略
+        eval_strategy="steps",              # 评估策略
         load_best_model_at_end=True,        # 训练结束后加载最优模型
         metric_for_best_model="eval_loss",  # 用于选择最优模型的指标
         fp16=torch.cuda.is_available(),     # 使用 float16 精度
         warmup_ratio=0.1,                   # 预热比例
         weight_decay=0.01,                  # 权重衰减
-        report_to=[],                       # 不上报到 wandb 等平台
+        report_to=["tensorboard"],          # 启用 TensorBoard 记录
         gradient_checkpointing=True,        # 启用梯度检查点
         gradient_checkpointing_kwargs={"use_reentrant": False},# 设置非重入模式
         optim="adamw_8bit",                 # 使用8位优化器
         group_by_length=False,              # 按长度分组
+        dataset_text_field="text",          # 数据集文本字段
+        max_seq_length=512,                 # 最大序列长度
+        packing=False,                      # 是否使用打包
     )
     
     print(f"加载数据集...")
@@ -112,15 +117,18 @@ def train_sft(base_model_path, sft_adapter_path, ratio):
         train_dataset=sampled_train,
         eval_dataset=sampled_valid,
         peft_config=LORA_CONFIG,
-        dataset_text_field="text",
-        max_seq_length=512,
         tokenizer=_tokenizer,
         args=sft_args,
-        packing=False,
     )
 
     print(f"开始 SFT 训练...")
-    trainer.train()
+    last_checkpoint = get_last_checkpoint(str(sft_adapter_path))
+    if last_checkpoint is not None:
+        print(f"发现 checkpoint: {last_checkpoint}, 断点续训")
+        trainer.train(resume_from_checkpoint=True)
+    else:
+        print(f"未发现有效 checkpoint, 从头训练")
+        trainer.train()
 
     print(f"保存 LoRA 适配器...")
     trainer.save_model(sft_adapter_path)
@@ -164,8 +172,6 @@ def main():
                 train_sft(base_model_path, sft_adapter_path, ratio)
             except Exception as e:
                 print(f"({version} 版本) SFT 适配器训练失败: {e}")
-                import traceback
-                traceback.print_exc()
                 break
 
 if __name__ == "__main__":

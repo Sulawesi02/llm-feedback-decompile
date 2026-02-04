@@ -18,12 +18,12 @@ from config import (
     QUANT_CONFIG,
 )
 from utils import ( 
-    machine_code_to_binary,
-    disasm_binary,
+    write_machine_code_to_bin,
+    disasm_bin,
     extract_asm,
-    compile_to_object,
+    compile_to_obj,
 )
-from src.prompts import construct_infer_prompt, construct_fix_prompt
+from prompts import construct_infer_prompt, construct_fix_prompt
 
 VERSION = VERSIONS[2][0] # 版本号
 
@@ -46,18 +46,21 @@ async def lifespan(app: FastAPI):
     tokenizer.truncation_side = "right"
     
     print("加载模型...")
-    model = PeftModel.from_pretrained(
-        AutoModelForCausalLM.from_pretrained(
-            str(base_model_path),
-            trust_remote_code=True,
-            quantization_config=QUANT_CONFIG,
-            device_map={"": "cuda:0"},
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-        ),
-        str(dpo_adapter_path),
-        device_map={"": "cuda:0"},
+    model = AutoModelForCausalLM.from_pretrained(
+        str(base_model_path),
+        trust_remote_code=True,
+        quantization_config=QUANT_CONFIG,
+        device_map={"": torch.cuda.current_device()},
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
     )
+    if dpo_adapter_path.exists():
+        print(f"加载 DPO 适配器: {dpo_adapter_path}")
+        model = PeftModel.from_pretrained(
+            model,
+            str(dpo_adapter_path),
+            device_map={"": torch.cuda.current_device()},
+        )
     model.eval() # 推理模式
     try:
         yield
@@ -93,8 +96,8 @@ async def decompile(request: DecompileRequest):
         
         o_path = None
         try:
-            binary_path = machine_code_to_binary(machine_code)            
-            disasm_result = disasm_binary(arch, binary_path)
+            bin_path = write_machine_code_to_bin(machine_code)            
+            disasm_result = disasm_bin(arch, bin_path)
             asm = extract_asm(arch, disasm_result)
 
             if it == 0:
@@ -103,29 +106,25 @@ async def decompile(request: DecompileRequest):
             else:
                 print("构造修复提示...")
                 messages = construct_fix_prompt(arch, asm, previous_outputs, last_error)
-            
-            inputs = tokenizer.apply_chat_template(
-                messages, 
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
-            ).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096).to(model.device)
 
             print("生成 C 函数代码...")
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs, 
-                    max_new_tokens=512,
+                    max_new_tokens=1024,
                     temperature=0.7,
                     top_p=0.95,
                     do_sample=True,
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                 )
-            outputs = tokenizer.decode(outputs[0], skip_special_tokens=True).split("assistant\n")[-1]
-
+            outputs = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("```c", "").replace("```", "").strip()
+            print(f"生成的 C 函数代码:\n{outputs}")
+            
             print("编译 C 函数代码...")
-            success, error_msg, o_path = compile_to_object(arch, outputs)
+            success, error_msg, o_path = compile_to_obj(arch, outputs)
             if success:
                 print("编译成功")
                 best_outputs = outputs

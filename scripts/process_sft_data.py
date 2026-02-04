@@ -14,7 +14,7 @@ from src.config import (
     BASE_MODEL_DIR,
     VERSIONS,
 )
-from src.utils import extract_compilation_data
+from src.utils import extract_data
 
 SFT_DATA_RATIO = 0.05 # SFT 数据生成采样比例
 
@@ -60,7 +60,7 @@ def main():
         print("格式化训练数据...")
         formatted_train = []
         for item in tqdm(sampled_train, desc="生成 SFT 训练数据进度"):
-            for arch, asm, c_code, _ in extract_compilation_data(item):
+            for c_code, arch, asm, _ in extract_data(item):
                 entry = {
                     "instruction": f"根据给定的目标架构({arch})和汇编代码({asm})，输出一个在语义上完全等价的 C 函数实现",
                     "outputs": c_code,
@@ -84,7 +84,7 @@ def main():
         print("格式化验证数据...")
         formatted_valid = []
         for item in tqdm(sampled_valid, desc="生成验证数据进度"):
-            for arch, asm, c_code, _ in extract_compilation_data(item):
+            for c_code, arch, asm, _ in extract_data(item):
                 entry = {
                     "instruction": f"根据给定的目标架构({arch})和汇编代码({asm})，输出一个在语义上完全等价的 C 函数实现",
                     "outputs": c_code,

@@ -27,11 +27,8 @@ DPO_ADAPTER_DIR = MODEL_DIR / "dpo_adapter"
 VERSIONS = [ # (版本号, 数据比例)
     ("v1", 0.10), 
     ("v2", 0.50),
-    ("v3", 1.00),
+    # ("v3", 1.00),
 ]
-
-# 工作目录
-TEMP_DIR = Path(tempfile.gettempdir()) / "workdir"
 
 # 评估目录
 EVAL_DIR = PROJECT_ROOT / "eval"

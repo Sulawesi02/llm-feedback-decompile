@@ -4,7 +4,10 @@ import tempfile
 import shutil
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Iterator
-from src.config import TEMP_DIR
+
+# 工作目录
+TEMP_DIR = Path(tempfile.gettempdir()) / "workdir"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 ASM_PATTERNS = {
     "x86": re.compile(r'^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2}\s+)+)(.+)$', re.IGNORECASE | re.MULTILINE),
@@ -27,7 +30,7 @@ def get_compiler_config(arch: str) -> tuple:
     else:
         raise ValueError(f"不支持的架构: {arch}")
 
-def compile_to_object(arch: str, c_code: str) -> tuple:
+def compile_to_obj(arch: str, c_code: str) -> tuple:
     """
     将 C 函数代码编译为 .o文件
     """
@@ -57,13 +60,13 @@ def compile_to_object(arch: str, c_code: str) -> tuple:
             shutil.rmtree(workdir, ignore_errors=True)
         return False, str(e), None
 
-def disasm_object(arch: str, binary_path: str) -> str:
+def disasm_obj(arch: str, bin_path: str) -> str:
     """
     反汇编 .o 文件
     """
     try:
         _, objdump_cmd, _ = get_compiler_config(arch)
-        cmd = [objdump_cmd, "-d", binary_path]
+        cmd = [objdump_cmd, "-d", bin_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         
         if result.returncode != 0:
@@ -115,40 +118,57 @@ def extract_asm_and_machine(arch: str, disasm_output: str) -> Tuple[Optional[str
     except Exception:
         return None, None
 
-def machine_code_to_binary(machine_code: str) -> Path:
+def extract_data(item: Dict) -> Iterator[Tuple[str, str, str, Optional[str]]]:
+    """
+    从数据集条目中提取 (C代码, 架构, 汇编, 机器码) 四元组
+    """
+    c_code = item.get("c_code")
+    compilations = item.get("compilations", {})
+    
+    for arch, info in compilations.items():
+        if not info:
+            continue
+        
+        asm = info.get("asm")
+        machine_code = info.get("machine_code")
+        if c_code and asm and machine_code:
+            yield c_code, arch, asm, machine_code
+
+def write_machine_code_to_bin(machine_code: str) -> Path:
     """
     将机器码字符串写入二进制文件
     """
+    bin_path = None
     try:
         hex_str = machine_code.replace(" ", "")
-        binary_data = bytes.fromhex(hex_str)
+        bin_data = bytes.fromhex(hex_str)
         
         workdir = tempfile.mkdtemp(dir=str(TEMP_DIR))
 
-        binary_path = Path(workdir) / "temp.bin"
-        binary_path.write_bytes(binary_data)
+        bin_path = Path(workdir) / "temp.bin"
+        bin_path.write_bytes(bin_data)
         
-        return binary_path
+        return bin_path
     except Exception as e:
-        if binary_path and binary_path.exists():
-            binary_path.unlink()
-        return None
+        if bin_path and bin_path.exists():
+            bin_path.unlink()
+        raise ValueError(f"写入二进制文件失败: {e}")
 
-def disasm_binary(arch: str, binary_path: str) -> str:
+def disasm_bin(arch: str, bin_path: str) -> str:
     """
     反汇编 .bin 文件
     """
     try:
         _, objdump_cmd, arch_flag = get_compiler_config(arch)
-        cmd = [objdump_cmd, "-D", "-b", "binary", "-m", arch_flag, binary_path]
+        cmd = [objdump_cmd, "-D", "-b", "binary", "-m", arch_flag, bin_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         
         if result.returncode != 0:
             return None
         
         return result.stdout
-    except Exception:
-        return None
+    except Exception as e:
+        raise ValueError(f"反汇编二进制文件失败: {e}")
 
 def extract_asm(arch: str, disasm_output: str) -> str:
     """
@@ -169,22 +189,5 @@ def extract_asm(arch: str, disasm_output: str) -> str:
         
         return '\n'.join(asm_lines) if asm_lines else None
         
-    except Exception:
-        return None
-
-def extract_compilation_data(item: Dict) -> Iterator[Tuple[str, str, str, Optional[str]]]:
-    """
-    从数据集条目中提取 (架构, 汇编, C代码, 机器码) 四元组
-    """
-    if not item.get("c_code") or not item.get("compilations"):
-        return
-
-    c_code = item["c_code"]
-    compilations = item["compilations"]
-
-    for arch in ["x86", "arm"]:
-        if arch in compilations and compilations[arch] and "asm" in compilations[arch]:
-            asm = compilations[arch]["asm"]
-            machine_code = compilations[arch]["machine_code"]
-            if asm:
-                yield arch, asm, c_code, machine_code
+    except Exception as e:
+        raise ValueError(f"提取汇编代码失败: {e}")

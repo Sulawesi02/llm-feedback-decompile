@@ -1,11 +1,9 @@
 import sys
 import json
-import torch
-import gc
+import random
 from pathlib import Path
 from tqdm import tqdm
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # 添加项目根目录到 sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -13,15 +11,57 @@ from src.config import (
     TRAIN_DATA, 
     VALID_DATA, 
     DPO_DATA_DIR, 
-    MODEL_NAME,
-    BASE_MODEL_DIR, 
-    VERSIONS,
-    QUANT_CONFIG,
 )
-from src.utils import extract_compilation_data
-from src.prompts import construct_bad_code_prompt
+from src.utils import extract_data
 
 DPO_DATA_RATIO = 0.05 # DPO 数据生成采样比例
+
+def generate_bad_code(c_code: str) -> str:
+    """
+    通过简单的规则扰动生成错误代码
+    """
+    lines = c_code.splitlines()
+    if not lines:
+        return c_code
+        
+    mutation_type = random.choice(["delete", "swap", "modify_op", "modify_num"])
+    
+    try:
+        if mutation_type == "delete" and len(lines) > 2:
+            # 随机删除一行非空行（避开开头结尾）
+            idx = random.randint(1, len(lines) - 2)
+            lines.pop(idx)
+            
+        elif mutation_type == "swap" and len(lines) > 3:
+            # 随机交换两行
+            idx1 = random.randint(1, len(lines) - 2)
+            idx2 = random.randint(1, len(lines) - 2)
+            lines[idx1], lines[idx2] = lines[idx2], lines[idx1]
+            
+        elif mutation_type == "modify_op":
+            # 替换运算符
+            code_str = "\n".join(lines)
+            ops = [("+", "-"), ("*", "/"), ("==", "!="), (">", "<"), ("&", "|")]
+            op = random.choice(ops)
+            if op[0] in code_str:
+                code_str = code_str.replace(op[0], op[1], 1)
+                return code_str
+                
+        elif mutation_type == "modify_num":
+            # 修改数字
+            code_str = "\n".join(lines)
+            import re
+            nums = re.findall(r'\b\d+\b', code_str)
+            if nums:
+                target = random.choice(nums)
+                new_num = str(int(target) + random.randint(1, 10))
+                code_str = code_str.replace(target, new_num, 1)
+                return code_str
+                
+    except Exception:
+        pass
+        
+    return "\n".join(lines)
 
 def main():
     if not TRAIN_DATA.exists():
@@ -31,19 +71,6 @@ def main():
         print(f"错误: 验证集不存在: {VALID_DATA}")
         return
     DPO_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not MODEL_NAME:
-        print("错误: 模型名称未配置")
-        return
-    if not BASE_MODEL_DIR.exists():
-        print(f"错误: 基座模型目录不存在: {BASE_MODEL_DIR}")
-        return
-    base_model_path = BASE_MODEL_DIR / MODEL_NAME
-    if not base_model_path.exists():
-        print(f"错误: 基座模型不存在: {base_model_path}")
-        return
-    if not VERSIONS:
-        print("错误: 版本未配置")
-        return
     
     train_output_path = DPO_DATA_DIR / "train_data.jsonl"
     valid_output_path = DPO_DATA_DIR / "valid_data.jsonl"
@@ -55,23 +82,6 @@ def main():
         print("DPO 训练数据和验证数据均已存在，跳过处理。")
         return
 
-    print("加载分词器...")
-    tokenizer = AutoTokenizer.from_pretrained(str(base_model_path), trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-    tokenizer.truncation_side = "right"
-    
-    print("加载模型...")
-    model = AutoModelForCausalLM.from_pretrained(
-        str(base_model_path),
-        trust_remote_code=True,
-        quantization_config=QUANT_CONFIG,
-        device_map={"": "cuda"},
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    )
-    model.eval() # 推理模式
-    
     if not train_exists:
         print("生成训练数据...")
         raw_train = load_dataset("json", data_files=str(TRAIN_DATA), split="train")
@@ -82,22 +92,8 @@ def main():
         print("格式化训练数据...")
         formatted_train = []
         for item in tqdm(sampled_train, desc="生成 DPO 训练数据进度"):
-            for arch, asm, c_code, _ in extract_compilation_data(item):
-                bad_code_prompt = construct_bad_code_prompt(c_code)
-                text = tokenizer.apply_chat_template(bad_code_prompt, tokenize=False, add_generation_prompt=True)
-                inputs = tokenizer(text, return_tensors="pt").to(model.device)
-                
-                with torch.no_grad():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=512,
-                        temperature=0.7,
-                        top_p=0.95,
-                        do_sample=True,
-                        eos_token_id=tokenizer.eos_token_id,
-                        pad_token_id=tokenizer.pad_token_id,
-                    )
-                rejected_code = tokenizer.decode(outputs[0], skip_special_tokens=True).split("assistant\n")[-1]
+            for c_code, arch, asm, _ in extract_data(item):
+                rejected_code = generate_bad_code(c_code)
                 
                 entry = {
                     "prompt": f"根据给定的目标架构({arch})和汇编代码({asm})，输出一个在语义上完全等价的 C 函数实现",
@@ -126,22 +122,8 @@ def main():
 
         formatted_valid = []
         for item in tqdm(sampled_valid, desc="生成 DPO 验证数据进度"):
-            for arch, asm, c_code, _ in extract_compilation_data(item):
-                bad_code_prompt = construct_bad_code_prompt(c_code)
-                text = tokenizer.apply_chat_template(bad_code_prompt, tokenize=False, add_generation_prompt=True)
-                inputs = tokenizer(text, return_tensors="pt").to(model.device)
-                
-                with torch.no_grad():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=512,
-                        temperature=0.7,
-                        top_p=0.95,
-                        do_sample=True,
-                        eos_token_id=tokenizer.eos_token_id,
-                        pad_token_id=tokenizer.pad_token_id,
-                    )
-                rejected_code = tokenizer.decode(outputs[0], skip_special_tokens=True).split("assistant\n")[-1]
+            for c_code, arch, asm, _ in extract_data(item):
+                rejected_code = generate_bad_code(c_code)
                 
                 entry = {
                     "prompt": f"根据给定的目标架构({arch})和汇编代码({asm})，输出一个在语义上完全等价的 C 函数实现",
@@ -155,11 +137,6 @@ def main():
             for entry in formatted_valid:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         print(f"保存 {len(formatted_valid)} 条验证数据到 {valid_output_path}")
-
-    # 清理资源
-    del model, tokenizer, trainer
-    gc.collect()
-    torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main()

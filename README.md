@@ -213,7 +213,7 @@ python scripts/process_dpo_data.py
 - 构造 DPO 数据集
   - prompt : arch + 汇编代码
   - chosen (正例) : 原始数据集中正确的 C 代码。
-  - rejected (负例) : 基座模型基于正确 C 代码生成的 **错误/低质量** 代码。
+  - rejected (负例) : 对原始正确 C 代码进行**简单规则扰动**（如删除行、交换行、修改运算符/数字）生成的错误代码。
 - 生成的 DPO 数据保存到 `data/dpo_data/<train/valid>_data.jsonl`。
 
 ### 5. DPO 对齐
@@ -234,7 +234,7 @@ python scripts/train_dpo.py
 python scripts/evaluate.py
 ```
 
-- 加载 **基座模型**，挂载 **DPO 适配器**。
+- 加载 **基座模型** ，挂载 **DPO 适配器**。
 - 在测试集上评估反编译成功率和语义等性。
 - 结果保存到 `eval/<版本>.jsonl`。
 

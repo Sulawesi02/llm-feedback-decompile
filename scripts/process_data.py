@@ -17,8 +17,8 @@ from src.config import (
     DEDUP_DATA_DIR,
 )
 from src.utils import (
-    compile_to_object,
-    disasm_object,
+    compile_to_obj,
+    disasm_obj,
     extract_asm_and_machine, 
 )
 
@@ -34,24 +34,28 @@ def process_single_sample(c_code: str) -> list:
         "compilations": {}
     }
     
-    has_success = False
     created_workdirs = []
     try:
         for arch in ARCHES:
-            success, _, o_path = compile_to_object(arch, c_code)
-            if success and o_path:
-                created_workdirs.append(Path(o_path).parent)
-                disasm_result = disasm_object(arch, o_path)
-                asm, machine_code = extract_asm_and_machine(arch, disasm_result)
-                if asm and machine_code:
-                    entry["compilations"][arch] = {
-                        "asm": asm,
-                        "machine_code": machine_code
-                    }
-                    has_success = True
-        if has_success:
-            return [entry]
-        return []
+            success, _, o_path = compile_to_obj(arch, c_code)
+            if not (success and o_path):
+                return []
+                
+            created_workdirs.append(Path(o_path).parent)
+            disasm_result = disasm_obj(arch, o_path)
+            asm, machine_code = extract_asm_and_machine(arch, disasm_result)
+            
+            if not (asm and machine_code):
+                return []
+                
+            entry.get("compilations", {})[arch] = {
+                "asm": asm,
+                "machine_code": machine_code
+            }
+        # 必须x86跟arm的内容都不为空才生成
+        if not (entry["compilations"].get("x86") and entry["compilations"].get("arm")):
+            return []
+        return [entry]
     except Exception:
         return []
     finally:
@@ -178,7 +182,7 @@ def main():
                             sample = json.loads(line)
                         except:
                             continue
-                        c_code = sample["text"]["func_def"].strip()
+                        c_code = sample.get("text", {}).get("func_def", "").strip()
                         if c_code:
                             tasks.append(c_code)
                             total_samples += 1

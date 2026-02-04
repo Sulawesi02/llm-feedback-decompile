@@ -2,10 +2,11 @@ import sys
 import torch
 import gc
 from pathlib import Path
-from trl import DPOTrainer, DPOConfig
-from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.trainer_utils import get_last_checkpoint
 from peft import PeftModel
+from trl import DPOConfig, DPOTrainer
+from datasets import load_dataset
 
 # 添加项目根目录到 sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -38,21 +39,25 @@ def train_dpo(base_model_path, ratio, sft_adapter_path, dpo_adapter_path):
     _tokenizer = get_tokenizer(base_model_path)
     
     print("加载模型...")
-    model = PeftModel.from_pretrained(
-        AutoModelForCausalLM.from_pretrained(
-            str(base_model_path),
-            trust_remote_code=True,
-            quantization_config=QUANT_CONFIG,
-            device_map={"": "cuda"},
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-        ),
-        str(sft_adapter_path),
-        device_map={"": "cuda"},
+    model = AutoModelForCausalLM.from_pretrained(
+        str(base_model_path),
+        trust_remote_code=True,
+        quantization_config=QUANT_CONFIG,
+        device_map={"": torch.cuda.current_device()},
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
     )
+    model.config.use_cache = False
     
-    print("将 SFT 适配器合并到基座模型...")
-    model = model.merge_and_unload()
+    if sft_adapter_path.exists():
+        print(f"加载 SFT 适配器: {sft_adapter_path}")
+        model = PeftModel.from_pretrained(
+            model,
+            str(sft_adapter_path),
+            device_map={"": torch.cuda.current_device()},
+        )
+        print("将 SFT 适配器合并到基座模型...")
+        model = model.merge_and_unload()
     
     dpo_args = DPOConfig(
         output_dir=str(dpo_adapter_path),
@@ -64,17 +69,19 @@ def train_dpo(base_model_path, ratio, sft_adapter_path, dpo_adapter_path):
         logging_steps=10,                   # 打印日志频率
         save_steps=100,                     # 保存模型检查点频率
         eval_steps=100,                     # 评估模型频率
-        evaluation_strategy="steps",        # 评估策略
+        eval_strategy="steps",              # 评估策略
         load_best_model_at_end=True,        # 训练结束后加载最优模型
-        metric_for_best_model="eval_reward/chosen",  # 用于选择最优模型的指标
+        metric_for_best_model="eval_rewards/chosen",  # 用于选择最优模型的指标
         fp16=torch.cuda.is_available(),     # 使用 float16 精度
         warmup_ratio=0.1,                   # 预热比例
         weight_decay=0.01,                  # 权重衰减
-        report_to=[],                       # 不上报到 wandb 等平台
+        report_to=["tensorboard"],          # 启用 TensorBoard 记录
         gradient_checkpointing=True,        # 启用梯度检查点
         gradient_checkpointing_kwargs={"use_reentrant": False},# 设置非重入模式
         optim="adamw_8bit",                 # 使用8位优化器
         group_by_length=False,              # 按长度分组
+        max_length=512,
+        max_prompt_length=256,
     )
     
     print(f"加载数据集...")
@@ -94,14 +101,20 @@ def train_dpo(base_model_path, ratio, sft_adapter_path, dpo_adapter_path):
         train_dataset=sampled_train,
         eval_dataset=sampled_valid,
         peft_config=LORA_CONFIG,
-        max_length=512,
-        max_prompt_length=256,
         tokenizer=_tokenizer,
         args=dpo_args,
     )
 
     print(f"开始 DPO 训练...")
-    trainer.train()
+    
+    # 检查是否存在 checkpoint
+    last_checkpoint = get_last_checkpoint(str(dpo_adapter_path))
+    if last_checkpoint is not None:
+        print(f"发现 checkpoint: {last_checkpoint}, 断点续训")
+        trainer.train(resume_from_checkpoint=True)
+    else:
+        print(f"未发现有效 checkpoint, 从头训练")
+        trainer.train()
     
     print(f"保存 DPO 适配器...")
     trainer.save_model(dpo_adapter_path)
@@ -141,16 +154,13 @@ def main():
         if not sft_adapter_path.exists():
             print(f"({version} 版本) SFT 适配器不存在，跳过")
             continue
-        print(f"\n{'='*20} 开始训练 ({version} 版本) DPO 适配器 (数据比例: {ratio}) {'='*20}")
-        try:
-            train_dpo(base_model_path, ratio, sft_adapter_path, dpo_adapter_path)
-        except Exception as e:
-            print(f"({version} 版本) DPO 适配器训练失败: {e}")
-            import traceback
-            traceback.print_exc()
-            break
-
-    print("\n训练结束！")
+        else:
+            print(f"\n{'='*20} 开始训练 ({version} 版本) DPO 适配器 (数据比例: {ratio}) {'='*20}")
+            try:
+                train_dpo(base_model_path, ratio, sft_adapter_path, dpo_adapter_path)
+            except Exception as e:
+                print(f"({version} 版本) DPO 适配器训练失败: {e}")
+                break
 
 if __name__ == "__main__":
     main()
