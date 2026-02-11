@@ -1,7 +1,5 @@
 import json
 import sys
-import re
-import shutil
 import torch
 import gc
 from pathlib import Path
@@ -14,7 +12,7 @@ from datasets import load_dataset
 # 添加项目根目录到 sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import (
-    TEST_DATA, 
+    PROCESSED_DATA_DIR, 
     EVAL_DIR,
     MODEL_NAME,
     BASE_MODEL_DIR, 
@@ -22,40 +20,55 @@ from src.config import (
     DPO_ADAPTER_DIR,
     VERSIONS,
     QUANT_CONFIG,
+    MAX_CONTEXT_TOKENS,
+    MAX_PROMPT_TOKENS,
 )
-from src.utils import (
-    extract_data, 
-    compile_to_obj,
+from src.compiler import (
+    test_func,
 )
 from src.prompts import (
     construct_infer_prompt,
     construct_fix_prompt,
-    construct_equal_prompt
 )
 
-MAX_SAMPLES = 200 # 最大样本数
+MAX_SAMPLES = 100 # 最大样本数
 MAX_ITERS = 3 # 最大迭代次数
 
 _tokenizer = None
-_model = None
+_basemodel = None
 
 def get_tokenizer(base_model_path: Path):
+    """获取或创建tokenizer（单例模式）"""
     global _tokenizer
     if _tokenizer is None:
-        print("加载分词器...")
         _tokenizer = AutoTokenizer.from_pretrained(str(base_model_path), trust_remote_code=True)
         _tokenizer.pad_token = _tokenizer.eos_token
         _tokenizer.padding_side = "right"
         _tokenizer.truncation_side = "right"
     return _tokenizer
 
-def process_single_sample(c_code: str, arch: str, asm: str, machine_code: str):
+def get_basemodel(base_model_path: Path):
+    """获取或创建基座模型（单例模式）"""
+    global _basemodel
+    if _basemodel is None:
+        _basemodel = AutoModelForCausalLM.from_pretrained(
+            str(base_model_path),
+            trust_remote_code=True,
+            quantization_config=QUANT_CONFIG,
+            device_map={"": torch.cuda.current_device()},
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        )
+        _basemodel.config.use_cache = False
+    return _basemodel
+    
+def process_single_sample(model, func_dep: str, func: str, test: str, asm: str):
     """
     处理单条样本
     """
-    print(f"输入 C 代码:\n{c_code}")
+    # print(f"输入 C 函数:\n{func}")
     gen_outputs = None
-    previous_outputs = None
+    prev_outputs = None
     last_error = None
     
     history = []
@@ -64,87 +77,76 @@ def process_single_sample(c_code: str, arch: str, asm: str, machine_code: str):
     for it in range(MAX_ITERS):
         print(f"\n--- 迭代 {it+1}/{MAX_ITERS} ---")
         
-        o_path = None
         try:
+            # ========== 生成阶段 ==========
             if it == 0:
                 print("构造推理提示...")
-                messages = construct_infer_prompt(arch, asm)
+                gen_messages = construct_infer_prompt(asm)
             else:
                 print("构造修复提示...")
-                messages = construct_fix_prompt(arch, asm, previous_outputs, last_error)
-            text = _tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            gen_inputs = _tokenizer(text, return_tensors="pt", truncation=True, max_length=4096).to(_model.device)
+                gen_messages = construct_fix_prompt(asm, prev_outputs, last_error)
+            gen_text = _tokenizer.apply_chat_template(gen_messages, tokenize=False, add_generation_prompt=True)            
+            
+            gen_inputs_check = _tokenizer(
+                gen_text, 
+                return_tensors="pt", 
+                truncation=False
+            )
+            gen_prompt_tokens = gen_inputs_check.input_ids.shape[1]
+            if gen_prompt_tokens > MAX_PROMPT_TOKENS:
+                print(f"输入长度 {gen_prompt_tokens} 超过最大长度")
+                error_msg = f"生成提示过长: {gen_prompt_tokens} tokens"
+                history.append({
+                    "iter": it,
+                    "success": False,
+                    "outputs": "",
+                    "error": error_msg,
+                })
+                break
+            
+            gen_inputs = _tokenizer(
+                gen_text, 
+                return_tensors="pt", 
+                truncation=True, 
+                max_length=gen_prompt_tokens
+            ).to(model.device)
 
-            print("生成 C 函数代码...")
+            print(f"生成 C 函数代码...")
+            gen_avail_tokens = MAX_CONTEXT_TOKENS - gen_prompt_tokens
             with torch.no_grad():
-                gen_outputs = _model.generate(
+                gen_outputs = model.generate(
                     **gen_inputs,
-                    max_new_tokens=1024,
+                    max_new_tokens=gen_avail_tokens,
                     temperature=0.7,
                     top_p=0.95,
                     do_sample=True,
                     eos_token_id=_tokenizer.eos_token_id,
                     pad_token_id=_tokenizer.pad_token_id,
                 )
-            gen_outputs = _tokenizer.decode(gen_outputs[0][gen_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("```c", "").replace("```", "").strip()
-            print(f"生成的 C 函数代码:\n{gen_outputs}")
-
-            print("编译 C 函数代码...")
-            success, error_msg, o_path = compile_to_obj(arch, gen_outputs)
+            gen_output_text = _tokenizer.decode(gen_outputs[0][gen_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("```cpp", "").replace("```c", "").replace("```", "").strip()
+            print(f"生成的 C 函数代码:\n{gen_output_text}")
+            # ========== 测试阶段 ==========
+            print("测试 C 函数代码...")
+            success, error_msg = test_func(func_dep, gen_output_text, test)
             if success:
-                print("编译成功，进行语义等价性判定...")
-                
-                messages = construct_equal_prompt(c_code, gen_outputs)
-                text = _tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                eq_inputs = _tokenizer(text, return_tensors="pt", truncation=True, max_length=4096).to(_model.device)
-                
-                with torch.no_grad():
-                    eq_outputs = _model.generate(
-                        **eq_inputs,
-                        max_new_tokens=512,
-                        temperature=0.7,
-                        top_p=0.95,
-                        do_sample=True,
-                        eos_token_id=_tokenizer.eos_token_id,
-                        pad_token_id=_tokenizer.pad_token_id,
-                    )
-                eq_outputs = _tokenizer.decode(eq_outputs[0][eq_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("```c", "").replace("```", "").strip()
-                print(f"语义等价性判定结果: {eq_outputs}")
-                
-                if eq_outputs == "0":
-                    print("判定通过：语义等价")
-                    best_outputs = gen_outputs
-                    history.append({
-                        "iter": it,
-                        "success": True,
-                        "outputs": gen_outputs,
-                        "error": "",
-                    })
-                    break
-                else:
-                    print("判定失败：语义不等价")
-                    error_msg = "判定失败：语义不等价"
-                    history.append({
-                        "iter": it,
-                        "success": False,
-                        "outputs": gen_outputs,
-                        "error": error_msg,
-                    })
-                    previous_outputs = gen_outputs
-                    last_error = error_msg
-                    continue
-            else:   
-                error_msg = error_msg[:1000]
-                print(f"编译失败: {error_msg.splitlines()[0] if error_msg else 'Unknown'}...")
-                history.append(
-                    {
-                        "iter": it,
-                        "success": False,
-                        "outputs": gen_outputs,
-                        "error": error_msg,
-                    }
-                )
-                previous_outputs = gen_outputs
+                print(f"  测试通过！")
+                best_outputs = gen_output_text
+                history.append({
+                    "iter": it,
+                    "success": True,
+                    "outputs": gen_output_text,
+                    "error": "",
+                })
+                break
+            else:
+                print(f"  测试失败: {error_msg.splitlines()[0]}")
+                history.append({
+                    "iter": it,
+                    "success": False,
+                    "outputs": gen_output_text,
+                    "error": error_msg,
+                })
+                prev_outputs = gen_output_text
                 last_error = error_msg
                 continue
         except Exception as e:
@@ -156,66 +158,117 @@ def process_single_sample(c_code: str, arch: str, asm: str, machine_code: str):
                 "error": f"生成 C 函数代码出错: {e}",
             })
             break
-        finally:
-            if o_path:
-                workdir = Path(o_path).parent
-                if workdir and workdir.exists():
-                    shutil.rmtree(workdir, ignore_errors=True)
-
     print(f"任务结束 | 最终状态: {'成功' if best_outputs else '失败'}")
     result_entry = {
-        "c_code": c_code,
-        "arch": arch,
+        "func": func,
         "asm": asm,
-        "machine_code": machine_code,
         "success": best_outputs is not None,
         "best_outputs": best_outputs,
         "history": history,
     }
     return result_entry
 
-def evaluate_model(base_model_path: Path, dpo_adapter_path: Optional[Path], eval_out_path: Path):
+def evaluate_model(test_input: Path, base_model_path: Path, dpo_adapter_path: Optional[Path], eval_out_path: Path):
     
-    global _tokenizer, _model
+    global _tokenizer, _basemodel
     
+    success_count = 0
+    total_count = 0
+    processed_keys = set()
+    existing_results = []
+
+    # 读取已有记录以支持断点续传
+    if eval_out_path.exists():
+        try:
+            with open(eval_out_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if not content:
+                    existing_results = []
+                else:
+                    for line in content.splitlines():
+                        if line.strip():
+                            existing_results.append(json.loads(line))
+            
+            print(f"发现 {len(existing_results)} 条已有记录")
+            
+            # 统计已有记录
+            for item in existing_results:
+                key = item.get("func")
+                if key:
+                    processed_keys.add(key)
+                if item.get("success"):
+                    success_count += 1
+                total_count += 1
+                
+        except Exception as e:
+            print(f"读取现有结果失败: {e}, 将重新开始")
+            existing_results = []
+
+    # 检查是否已达到目标记录数
+    target_count = MAX_SAMPLES * 2
+    if total_count >= target_count:
+        print(f"已达到目标记录数 ({MAX_SAMPLES} 条样本 -> {target_count} 条记录)，跳过评估")
+        accuracy = success_count / total_count if total_count > 0 else 0
+        print(f"总记录数: {total_count}")
+        print(f"成功编译数: {success_count}")
+        print(f"编译通过率: {accuracy:.2%}")
+        return
+
+    print(f"当前进度: {total_count}/{target_count}, 继续评估...")
+
     print("加载分词器...")
     _tokenizer = get_tokenizer(base_model_path)
     
     print("加载模型...")
-    _model = AutoModelForCausalLM.from_pretrained(
-        str(base_model_path),
-        trust_remote_code=True,
-        quantization_config=QUANT_CONFIG,
-        device_map={"": torch.cuda.current_device()},
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    )
+    _basemodel = get_basemodel(base_model_path)
+    model = _basemodel
     if dpo_adapter_path:
         print(f"加载 DPO 适配器: {dpo_adapter_path}")
-        _model = PeftModel.from_pretrained(
-            _model,
+        model = PeftModel.from_pretrained(
+            _basemodel,
             str(dpo_adapter_path),
             device_map={"": torch.cuda.current_device()},
         )
-    _model.eval() # 推理模式
+    model.eval() # 推理模式
 
-    results = []
-    success_count = 0
-    total_count = 0
+    if existing_results:
+        with open(eval_out_path, "w", encoding="utf-8") as f:
+            for item in existing_results:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        f_out = open(eval_out_path, "a", encoding="utf-8")
+    else:
+        # 新文件
+        f_out = open(eval_out_path, "w", encoding="utf-8")
 
-    raw_test = load_dataset("json", data_files=str(TEST_DATA), split="train")
-    sampled_test = raw_test.select(range(MAX_SAMPLES))
+    test_data = load_dataset("json", data_files=str(test_input), split="train")
+    sampled_test = test_data.select(range(MAX_SAMPLES))
 
-    for item in tqdm(sampled_test, desc="评估进度"):
-        for c_code, arch, asm, machine_code in extract_data(item):
-            result_entry = process_single_sample(c_code, arch, asm, machine_code)
-            results.append(result_entry)
+    try:
+        for item in tqdm(sampled_test, desc="评估进度"):
+            func_dep = item.get("func_dep")
+            func = item.get("func")
+            test = item.get("test")
+            asm = item.get("asm")
+            
+            if not func or not asm or not test:
+                print("Skipping invalid item")
+                continue
+
+            # 检查是否已处理
+            key = func
+            if key in processed_keys:
+                continue
+
+            result_entry = process_single_sample(model, func_dep, func, test, asm)
+            
+            f_out.write(json.dumps(result_entry, ensure_ascii=False) + "\n")
+            f_out.flush()
+            
             if result_entry.get("success"):
                 success_count += 1
             total_count += 1
-
-    with open(eval_out_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    finally:
+        f_out.close()
 
     accuracy = success_count / total_count if total_count > 0 else 0
     print(f"总样本数: {total_count}")
@@ -223,47 +276,26 @@ def evaluate_model(base_model_path: Path, dpo_adapter_path: Optional[Path], eval
     print(f"编译通过率: {accuracy:.2%}")
 
     # 清理资源
-    del _model
+    del model
     gc.collect()
     torch.cuda.empty_cache()
 
 def main():
-    if not TEST_DATA.exists():
-        print(f"错误: 测试集不存在: {TEST_DATA}")
-        return
-    EVAL_DIR.mkdir(parents=True, exist_ok=True)
+    test_input = PROCESSED_DATA_DIR / "test_data.jsonl"
     base_model_path = BASE_MODEL_DIR / MODEL_NAME
-    if not base_model_path.exists():
-        print(f"错误: 基座模型不存在: {base_model_path}")
-        return
-    if not SFT_ADAPTER_DIR.exists():
-        print(f"错误: SFT 适配器目录不存在: {SFT_ADAPTER_DIR}")
-        return
-    if not DPO_ADAPTER_DIR.exists():
-        print(f"错误: DPO 适配器目录不存在: {DPO_ADAPTER_DIR}")
-        return
-    if not VERSIONS:
-        print(f"错误: 版本号未配置")
-        return
+    EVAL_DIR.mkdir(parents=True, exist_ok=True)
     
     # 1. 评估基座模型
     base_eval_out = EVAL_DIR / "base_model.jsonl"
-    if base_eval_out.exists():
-        print("基座模型评估结果已存在，跳过")
-    else:
-        print(f"\n{'='*20} 开始评估基座模型 {'='*20}")
-        try:
-            evaluate_model(base_model_path, None, base_eval_out)
-        except Exception as e:
-            print(f"基座模型评估失败: {e}")
+    print(f"{'='*20} 开始评估基座模型 {'='*20}")
+    try:
+        evaluate_model(test_input, base_model_path, None, base_eval_out)
+    except Exception as e:
+        print(f"基座模型评估失败: {e}")
 
     # 2. 评估各个版本
     for version, _ in VERSIONS:
         eval_out_path = EVAL_DIR / f"{version}.jsonl"
-        if eval_out_path.exists():
-            print(f"({version} 版本) 评估结果已存在，跳过")
-            continue
-        
         sft_adapter_path = SFT_ADAPTER_DIR / version
         if not sft_adapter_path.exists():
             print(f"错误: SFT 适配器不存在: {sft_adapter_path}")
@@ -272,9 +304,9 @@ def main():
         if not dpo_adapter_path.exists():
             print(f"错误: DPO 适配器不存在: {dpo_adapter_path}")
             continue
-        print(f"\n{'='*20} 开始评估 ({version} 版本) {'='*20}")
+        print(f"{'='*20} 开始评估 ({version} 版本) {'='*20}")
         try:
-            evaluate_model(base_model_path, dpo_adapter_path, eval_out_path)
+            evaluate_model(test_data, base_model_path, dpo_adapter_path, eval_out_path)
         except Exception as e:
             print(f"{version} 版本模型评估失败: {e}")
 

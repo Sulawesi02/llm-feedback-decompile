@@ -31,8 +31,13 @@ async function decompile() {
         const data = await response.json();
 
         if (response.ok) {
-            output.textContent = data.best_c_code || "// 生成 C 函数代码失败";
-            output.style.color = "#f8f8f2";
+            if (data.success) {
+                output.textContent = data.best_outputs;
+                output.style.color = "#0b0b06ff";
+            } else {
+                output.textContent = `// 反编译失败`;
+                output.style.color = "#ff6b6b";
+            }
         } else {
             output.textContent = `// 服务器错误:\n${data.detail || data.error || '未知错误'}`;
             output.style.color = "#ff6b6b";

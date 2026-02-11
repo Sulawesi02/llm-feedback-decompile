@@ -7,14 +7,9 @@ WORKDIR /app
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list && \
     sed -i 's|http://security.ubuntu.com/ubuntu/|http://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list
 
-# 系统工具 + 交叉编译 + capstone + qemu
+# 系统工具
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget ca-certificates unzip git curl bzip2 build-essential vim \
-    openjdk-17-jdk-headless tzdata libxext6 libxrender1 libxtst6 libxi6 \
-    gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-    libc6-dev-arm64-cross \
-    libcapstone-dev capstone-tool \
-    qemu-user \
+    ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 # pip 清华源

@@ -1,4 +1,3 @@
-import tempfile
 import torch
 from pathlib import Path
 from transformers import BitsAndBytesConfig
@@ -11,10 +10,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_DATA_DIR = DATA_DIR / "raw_data"
 PROCESSED_DATA_DIR = DATA_DIR / "processed_data"
-DEDUP_DATA_DIR = DATA_DIR / "dedup_data"
-TRAIN_DATA = DEDUP_DATA_DIR / "train_data.jsonl"
-VALID_DATA = DEDUP_DATA_DIR / "valid_data.jsonl"
-TEST_DATA = DEDUP_DATA_DIR / "test_data.jsonl"
 SFT_DATA_DIR = DATA_DIR / "sft_data"
 DPO_DATA_DIR = DATA_DIR / "dpo_data"
 
@@ -51,3 +46,6 @@ LORA_CONFIG = LoraConfig(
     target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
     use_rslora=True,
 )
+
+MAX_CONTEXT_TOKENS = 32768 # 最大上下文 tokens 数
+MAX_PROMPT_TOKENS = 24576 # 最大提示 tokens 数

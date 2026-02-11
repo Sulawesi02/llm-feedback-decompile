@@ -20,7 +20,7 @@ def download_base_model(repo_id: str, local_dir: Path, max_retries=10):
     
     for i in range(max_retries):
         try:
-            print(f"\n[{i+1}/{max_retries}] 开始下载/验证模型文件...")
+            print(f"[{i+1}/{max_retries}] 开始下载/验证模型文件...")
             
             path = snapshot_download(
                 repo_id=repo_id,
@@ -40,12 +40,6 @@ def download_base_model(repo_id: str, local_dir: Path, max_retries=10):
                 raise RuntimeError(f"模型下载失败，已重试 {max_retries} 次") from e
 
 def main():
-    if not MODEL_NAME:
-        print("错误: 模型名称未配置")
-        return
-    if not BASE_MODEL_DIR:
-        print("错误: 基座模型目录未配置")
-        return
     base_model_path = BASE_MODEL_DIR / MODEL_NAME
     base_model_path.mkdir(parents=True, exist_ok=True)
     

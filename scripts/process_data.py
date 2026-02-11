@@ -1,11 +1,8 @@
-import os
 import json
 import sys
 import hashlib
-import multiprocessing as mp
-import shutil
+import random
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 from datasets import load_dataset
 
@@ -14,59 +11,14 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import (
     RAW_DATA_DIR, 
     PROCESSED_DATA_DIR, 
-    DEDUP_DATA_DIR,
 )
-from src.utils import (
-    compile_to_obj,
-    disasm_obj,
-    extract_asm_and_machine, 
-)
-
-SPLITS = ["train", "valid", "test"]
-ARCHES = ["x86", "arm"]
-
-def process_single_sample(c_code: str) -> list:
-    """
-    处理单个 C 函数代码样本，编译并提取汇编代码和机器码
-    """
-    entry = {
-        "c_code": c_code,
-        "compilations": {}
-    }
-    
-    created_workdirs = []
-    try:
-        for arch in ARCHES:
-            success, _, o_path = compile_to_obj(arch, c_code)
-            if not (success and o_path):
-                return []
-                
-            created_workdirs.append(Path(o_path).parent)
-            disasm_result = disasm_obj(arch, o_path)
-            asm, machine_code = extract_asm_and_machine(arch, disasm_result)
-            
-            if not (asm and machine_code):
-                return []
-                
-            entry.get("compilations", {})[arch] = {
-                "asm": asm,
-                "machine_code": machine_code
-            }
-        # 必须x86跟arm的内容都不为空才生成
-        if not (entry["compilations"].get("x86") and entry["compilations"].get("arm")):
-            return []
-        return [entry]
-    except Exception:
-        return []
-    finally:
-        for workdir in created_workdirs:
-            if workdir and workdir.exists():
-                shutil.rmtree(workdir, ignore_errors=True)
 
 def normalize_text(text: str) -> list:
     """
     对文本进行归一化处理(替换换行符、制表符和多个空格为单个空格，最后按空格分割为 tokens 列表)
     """
+    if not text:
+        return []
     return text.replace("\r", "\n").replace("\t", " ").replace("\n", " ").split()
 
 def make_shingles(tokens: list, k: int) -> list:
@@ -92,7 +44,7 @@ def compute_minhash(shingles: list, num_perm: int = 64) -> list:
                 signature[i] = h
     return signature
 
-def lsh_deduplicate(records: list, field: str = "asm", num_perm: int = 64, bands: int = 8, shingle_size: int = 5) -> tuple:
+def lsh_deduplicate(records: list, field: str = "func", num_perm: int = 64, bands: int = 8, shingle_size: int = 5) -> tuple:
     if not records:
         return [], []
     if num_perm % bands != 0:
@@ -101,7 +53,9 @@ def lsh_deduplicate(records: list, field: str = "asm", num_perm: int = 64, bands
     buckets = {}
     kept_indices = []
     kept_records = []
-    for idx, rec in enumerate(records):
+    
+    print(f"开始去重处理 (字段: {field}, 总数: {len(records)})...")
+    for idx, rec in enumerate(tqdm(records, desc="计算 MinHash")):
         text = str(rec.get(field, "") or "")
         tokens = normalize_text(text)
         shingles = make_shingles(tokens, shingle_size)
@@ -128,101 +82,89 @@ def lsh_deduplicate(records: list, field: str = "asm", num_perm: int = 64, bands
         kept_records.append(rec)
     return kept_records, kept_indices
 
-def deduplicate_jsonl(input_path: Path, output_path: Path, field: str = "asm", num_perm: int = 64, bands: int = 8, shingle_size: int = 5) -> tuple:
-    input_path = Path(input_path)
-    output_path = Path(output_path)
-    try:
-        dataset = load_dataset("json", data_files=str(input_path), split="train")
-        records = [row for row in dataset]
-    except Exception as e:
-        records = []
-    dedup_records, _ = lsh_deduplicate(
-        records,
-        field=field,
-        num_perm=num_perm,
-        bands=bands,
-        shingle_size=shingle_size,
-    )
-    with output_path.open("w", encoding="utf-8") as f:
-        for rec in dedup_records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    return len(records), len(dedup_records)
-
 def main():
-    RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    DEDUP_DATA_DIR.mkdir(parents=True, exist_ok=True)
     
-    for split in SPLITS:
-        split_dir = RAW_DATA_DIR / split
-        processed_out_path = PROCESSED_DATA_DIR / f"{split}_data.jsonl"
-        deduplicated_out_path = DEDUP_DATA_DIR / f"{split}_data.jsonl"
+    # 1. 处理训练集 (Decompile-Bench) 并划分验证集
+    print("\n=== 处理训练数据 ===")
+    train_input = RAW_DATA_DIR / "train_data.jsonl"
+    train_output = PROCESSED_DATA_DIR / "train_data.jsonl"
+    valid_output = PROCESSED_DATA_DIR / "valid_data.jsonl"
+    
+    if train_input.exists():
+        print(f"训练数据文件已存在: {train_input}")
+    else:
+        train_data = load_dataset("json", data_files=str(train_input), split="train")
+        print("格式化训练数据...")
+        formatted_train = []
+        for item in tqdm(train_data, desc="格式化训练数据"):
+            data = {
+                "func": item["code"],
+                "asm": item["asm"]
+            }
+            formatted_train.append(data)
+        
+        print(f"  读取到 {len(formatted_train)} 条有效数据")
+        
+        # 去重
+        if formatted_train:
+            dedup_records, _ = lsh_deduplicate(formatted_train, field="func")
+            print(f"  去重结果: {len(formatted_train)} -> {len(dedup_records)}")
+            formatted_train = dedup_records
+            
+            # 划分训练集和验证集 (90% : 10%)
+            random.seed(42)
+            random.shuffle(formatted_train)
+            split_idx = int(len(formatted_train) * 0.90)
+            train_records = formatted_train[:split_idx]
+            valid_records = formatted_train[split_idx:]
+            
+            print(f"  划分数据集: 训练集 {len(train_records)} 条, 验证集 {len(valid_records)} 条")
+            
+            with open(train_output, "w", encoding="utf-8") as f:
+                for rec in train_records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(f"  已保存训练集: {train_output}")
+            
+            with open(valid_output, "w", encoding="utf-8") as f:
+                for rec in valid_records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(f"  已保存验证集: {valid_output}")
 
-        if processed_out_path.exists() and deduplicated_out_path.exists():
-            print(f"\n{split} 的 data 文件已存在，跳过生成")
-            continue
-
-        if not processed_out_path.exists():
-            jsonl_files = list(split_dir.glob("*.jsonl"))
-            if split == "train":
-                jsonl_files = jsonl_files[:6]
-            total_files = len(jsonl_files)
-            print(f"\n处理 {split} 数据集，共 {total_files} 个文件")
-
-            tasks = []
-            total_samples = 0
-            for i, jsonl_file in enumerate(jsonl_files):
-                print(f"处理文件({i+1}/{len(jsonl_files)}): {jsonl_file.name} ")
-                with open(jsonl_file, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            sample = json.loads(line)
-                        except:
-                            continue
-                        c_code = sample.get("text", {}).get("func_def", "").strip()
-                        if c_code:
-                            tasks.append(c_code)
-                            total_samples += 1
-
-            print(f"总共找到 {total_samples} 个 C 函数，开始多进程编译...")
-
-            max_workers = max(1, os.cpu_count() - 1)
-            print(f"使用 {max_workers} 个进程并行处理")
-
-            results_generated = 0
-            with open(processed_out_path, "w", encoding="utf-8") as out_f:
-                if tasks:
-                    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                        future_to_task = {executor.submit(process_single_sample, task): task for task in tasks}
-                        for future in tqdm(as_completed(future_to_task), total=len(tasks), desc="编译进度"):
-                            result_list = future.result()
-                            for item in result_list:
-                                out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
-                                results_generated += 1
-
-            print(f"\n{split} 处理完成！生成 {results_generated} 条数据")
-            print(f"\n保存到: {processed_out_path}")
-        else:
-            print(f"\n{split} 的 processed_data 文件已存在，跳过生成: {processed_out_path}")
-
-        if not deduplicated_out_path.exists():
-            print(f"\n开始对 {split} 数据进行去重...")
-            before_num, after_num = deduplicate_jsonl(
-                input_path=processed_out_path,
-                output_path=deduplicated_out_path,
-                field="c_code",
-                num_perm=64,
-                bands=8,
-                shingle_size=5,
-            )
-            print(f"{split} 去重完成: {before_num} -> {after_num}")
-            print(f"去重后数据保存到: {deduplicated_out_path}")
-        else:
-            print(f"\n{split} 的 dedup_data 文件已存在，跳过生成: {deduplicated_out_path}")
+    # 2. 处理测试集 (Decompile-Eval)
+    print("\n=== 处理测试数据 ===")
+    test_input = RAW_DATA_DIR / "test_data.jsonl"
+    test_output = PROCESSED_DATA_DIR / "test_data.jsonl"
+    
+    if test_input.exists():
+        print(f"测试数据文件已存在: {test_input}")
+    else:
+        valid_data = load_dataset("json", data_files=str(test_input), split="train")
+        print("格式化测试数据...")
+        formatted_train = []
+        for item in tqdm(valid_data, desc="格式化测试数据"):
+            data = {
+                "func_dep": item["func_dep"],
+                "func": item["func"],
+                "test": item["test"],
+                "asm": item["asm"]
+            }
+            formatted_train.append(data)
+        
+        print(f"  读取到 {len(formatted_train)} 条有效测试数据")
+        
+        # 去重
+        if formatted_train:
+            dedup_records, _ = lsh_deduplicate(formatted_train, field="func")
+            print(f"  去重结果: {len(formatted_train)} -> {len(dedup_records)}")
+            formatted_train = dedup_records
+        
+        with open(test_output, "w", encoding="utf-8") as f:
+            for rec in formatted_train:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        print(f"  已保存测试集: {test_output}")
+    
+    print("\n数据集处理完成！")
 
 if __name__ == "__main__":
-    mp.set_start_method('spawn', force=True)
     main()

@@ -27,7 +27,6 @@ def get_tokenizer(base_model_path: Path) -> AutoTokenizer:
     global _tokenizer
     
     if _tokenizer is None:
-        print("初始化分词器...")
         _tokenizer = AutoTokenizer.from_pretrained(str(base_model_path), trust_remote_code=True)
         _tokenizer.pad_token = _tokenizer.eos_token
         _tokenizer.padding_side = "right"
@@ -41,7 +40,7 @@ def format_sft_data(example):
     """
     messages = [
         {"role": "system", "content": example.get("instruction", "")},
-        {"role": "user", "content": example.get("outputs", "")},
+        {"role": "user", "content": example.get("response", "")},
     ]
     text = _tokenizer.apply_chat_template(
         messages, 
@@ -97,14 +96,14 @@ def train_sft(base_model_path, sft_adapter_path, ratio):
     )
     
     print(f"加载数据集...")
-    raw_train = load_dataset("json", data_files=str(SFT_DATA_DIR / "train_data.jsonl"), split="train")
-    raw_valid = load_dataset("json", data_files=str(SFT_DATA_DIR / "valid_data.jsonl"), split="train")
-    print(f"原始训练数据: {len(raw_train)} 条")
-    print(f"原始验证数据: {len(raw_valid)} 条")
+    train_data = load_dataset("json", data_files=str(SFT_DATA_DIR / "train_data.jsonl"), split="train")
+    valid_data = load_dataset("json", data_files=str(SFT_DATA_DIR / "valid_data.jsonl"), split="train")
+    print(f"原始训练数据: {len(train_data)} 条")
+    print(f"原始验证数据: {len(valid_data)} 条")
     
     print(f"采样数据集...")
-    sampled_train = raw_train.shuffle(seed=42).select(range(int(len(raw_train) * ratio)))
-    sampled_valid = raw_valid.shuffle(seed=42).select(range(int(len(raw_valid) * ratio)))
+    sampled_train = train_data.shuffle(seed=42).select(range(int(len(train_data) * ratio)))
+    sampled_valid = valid_data.shuffle(seed=42).select(range(int(len(valid_data) * ratio)))
     print(f"采样训练数据: {len(sampled_train)} 条")
     print(f"采样验证数据: {len(sampled_valid)} 条")
     
@@ -139,24 +138,8 @@ def train_sft(base_model_path, sft_adapter_path, ratio):
     torch.cuda.empty_cache()
 
 def main():
-    if not SFT_DATA_DIR.exists():
-        print(f"错误: SFT 数据目录不存在: {SFT_DATA_DIR}")
-        return
-    if not MODEL_NAME:
-        print("错误: 模型名称未配置")
-        return
-    if not BASE_MODEL_DIR:
-        print("错误: 基座模型目录未配置")
-        return
     base_model_path = BASE_MODEL_DIR / MODEL_NAME
-    if not base_model_path.exists():
-        print(f"错误: 基座模型不存在: {base_model_path}")
-        return
-    
     SFT_ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
-    if not VERSIONS:
-        print(f"错误: 版本号未配置")
-        return
     
     for version, ratio in VERSIONS:
         sft_adapter_path = SFT_ADAPTER_DIR / version
@@ -167,7 +150,7 @@ def main():
             continue
         else:
             sft_adapter_path.mkdir(parents=True, exist_ok=True)
-            print(f"\n{'='*20} 开始训练 ({version} 版本) SFT 适配器 (数据比例: {ratio}) {'='*20}")
+            print(f"{'='*20} 开始训练 ({version} 版本) SFT 适配器 (数据比例: {ratio}) {'='*20}")
             try:
                 train_sft(base_model_path, sft_adapter_path, ratio)
             except Exception as e:
