@@ -14,15 +14,14 @@
 ### 1. 构建环境
 推荐使用 Docker 容器以确保编译器环境一致性：
 ```bash
-docker build -t llm-feedback-decompile-env .
-```
+docker build -t llm-feedback-decompile:latest .```
 
 ### 2. 启动环境
 
 启动容器并将当前目录挂载到容器内的 `/app` 目录：
 
 ```bash
-docker run --gpus all -it -p 8000:8000 -v ${PWD}:/app llm-feedback-decompile-env
+docker run --gpus all -it -p 8000:8000 -v ${PWD}:/app llm-feedback-decompile:latest
 ```
 
 ### 3. 启动服务
@@ -146,11 +145,11 @@ python scripts/generate_dpo_data.py
 ### 1. 下载基座模型
 
 ```bash
-python scripts/download_basemodel.py
+python scripts/download_model.py
 ```
 
 - 按配置的 `MODEL_NAME` 下载基座模型，支持断点续传、多次自动重试。
-- 基座模型保存到 `model/base_models/<模型名>/` 。
+- 基座模型保存到 `model/<模型名>/` 。
 
 ### 2. SFT 微调
 
@@ -162,7 +161,7 @@ python scripts/train_sft.py
 
 - 遍历`VERSIONS`，从 SFT 数据集中按比例采样子集。
 - 将每个样本格式化为对话 Prompt。
-- 进行 QLoRA 微调，SFT 权重保存到 `model/sft_adapter/<版本>/`。
+- 进行 QLoRA 微调，SFT 权重保存到 `adapter/sft/<版本>/`。
 
 ### 3. DPO 对齐
 
@@ -174,7 +173,7 @@ python scripts/train_dpo.py
 
 - 遍历`VERSIONS`，从 DPO 数据集中按比例采样子集。
 - 加载 **基座模型** ，并 **合并 SFT 适配器** 作为新的基座。
-- 进行 QLoRA DPO 权重保存到 `model/dpo_adapter/<版本>/`。
+- 进行 QLoRA DPO 权重保存到 `adapter/dpo/<版本>/`。
 
 ### 4. 模型评估
 

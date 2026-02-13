@@ -1,6 +1,7 @@
 # User specified
 /data/
 /model/
+/adapter/
 /eval/
 
 # Python

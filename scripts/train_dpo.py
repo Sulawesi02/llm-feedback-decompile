@@ -12,10 +12,10 @@ from datasets import load_dataset
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import (
     DPO_DATA_DIR,
+    MODEL_DIR,
     MODEL_NAME,
-    BASE_MODEL_DIR,
-    SFT_ADAPTER_DIR,
-    DPO_ADAPTER_DIR,
+    SFT_DIR,
+    DPO_DIR,
     VERSIONS,
     QUANT_CONFIG,
     LORA_CONFIG,
@@ -44,9 +44,8 @@ def train_dpo(base_model_path, ratio, sft_adapter_path, dpo_adapter_path):
         quantization_config=QUANT_CONFIG,
         device_map={"": torch.cuda.current_device()},
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        use_cache=False,
     )
-    model.config.use_cache = False
     
     if sft_adapter_path.exists():
         print(f"加载 SFT 适配器: {sft_adapter_path}")
@@ -124,17 +123,17 @@ def train_dpo(base_model_path, ratio, sft_adapter_path, dpo_adapter_path):
     torch.cuda.empty_cache()
 
 def main():
-    base_model_path = BASE_MODEL_DIR / MODEL_NAME 
-    DPO_ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
+    base_model_path = MODEL_DIR / MODEL_NAME 
+    DPO_DIR.mkdir(parents=True, exist_ok=True)
     
     for version, ratio in VERSIONS:
-        dpo_adapter_path = DPO_ADAPTER_DIR / version
+        dpo_adapter_path = DPO_DIR / version
         dpo_adapter_exists = dpo_adapter_path.exists() and (dpo_adapter_path / "adapter_config.json").exists()
         if dpo_adapter_exists:
             print(f"({version} 版本) DPO 适配器已存在，跳过训练")
             continue
         
-        sft_adapter_path = SFT_ADAPTER_DIR / version
+        sft_adapter_path = SFT_DIR / version
         if not sft_adapter_path.exists():
             print(f"({version} 版本) SFT 适配器不存在，跳过")
             continue

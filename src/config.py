@@ -15,10 +15,13 @@ DPO_DATA_DIR = DATA_DIR / "dpo_data"
 
 # 模型目录
 MODEL_DIR = PROJECT_ROOT / "model"
-MODEL_NAME = "Qwen2.5-Coder-7B-Instruct"
-BASE_MODEL_DIR = MODEL_DIR / "base_models"
-SFT_ADAPTER_DIR = MODEL_DIR / "sft_adapter"
-DPO_ADAPTER_DIR = MODEL_DIR / "dpo_adapter"
+MODEL_NAME = "Qwen/Qwen2.5-Coder-7B-Instruct"
+AWQ_MODEL_NAME = "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ"
+
+# 适配器目录
+ADAPTER_DIR = PROJECT_ROOT / "adapter"
+SFT_DIR = ADAPTER_DIR / "sft"
+DPO_DIR = ADAPTER_DIR / "dpo"
 VERSIONS = [ # (版本号, 数据比例)
     ("v1", 0.10), 
     ("v2", 0.50),
@@ -47,5 +50,5 @@ LORA_CONFIG = LoraConfig(
     use_rslora=True,
 )
 
-MAX_CONTEXT_TOKENS = 32768 # 最大上下文 tokens 数
-MAX_PROMPT_TOKENS = 24576 # 最大提示 tokens 数
+MAX_PROMPT_TOKENS = 6144 # 最大提示 tokens 数
+MAX_GEN_TOKENS = 256 # 最大生成 tokens 数

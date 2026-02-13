@@ -10,13 +10,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
 from config import (
+    MODEL_DIR, 
     MODEL_NAME,
-    BASE_MODEL_DIR, 
-    DPO_ADAPTER_DIR,
+    DPO_DIR,
     VERSIONS, 
     QUANT_CONFIG,
-    MAX_CONTEXT_TOKENS,
     MAX_PROMPT_TOKENS,
+    MAX_GEN_TOKENS,
 )
 from compiler import ( 
     write_machine_code_to_bin,
@@ -31,8 +31,8 @@ MAX_ITERS = 3 # 最大迭代次数
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    base_model_path = BASE_MODEL_DIR / MODEL_NAME
-    dpo_adapter_path = DPO_ADAPTER_DIR / VERSION
+    base_model_path = MODEL_DIR / MODEL_NAME
+    dpo_adapter_path = DPO_DIR / VERSION
     
     print("加载分词器...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -50,7 +50,6 @@ async def lifespan(app: FastAPI):
         quantization_config=QUANT_CONFIG,
         device_map={"": torch.cuda.current_device()},
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
     )
     
     if dpo_adapter_path.exists():
@@ -114,9 +113,9 @@ async def decompile(request: Request, body: DecompileRequest):
             else:
                 print("构造修复提示...")
                 gen_messages = construct_fix_prompt(asm, prev_outputs, last_error)
-            gen_text = _tokenizer.apply_chat_template(gen_messages, tokenize=False, add_generation_prompt=True)            
+            gen_text = tokenizer.apply_chat_template(gen_messages, tokenize=False, add_generation_prompt=True)            
 
-            gen_inputs_check = _tokenizer(
+            gen_inputs_check = tokenizer(
                 gen_text, 
                 return_tensors="pt", 
                 truncation=False
@@ -133,7 +132,7 @@ async def decompile(request: Request, body: DecompileRequest):
                 })
                 break
             
-            gen_inputs = _tokenizer(
+            gen_inputs = tokenizer(
                 gen_text, 
                 return_tensors="pt", 
                 truncation=True, 
@@ -141,18 +140,18 @@ async def decompile(request: Request, body: DecompileRequest):
             ).to(model.device)
 
             print("生成 C 函数代码...")
-            gen_avail_tokens = MAX_CONTEXT_TOKENS - gen_prompt_tokens
             with torch.no_grad():
                 gen_outputs = model.generate(
                     **gen_inputs,
-                    max_new_tokens=gen_avail_tokens,
+                    max_new_tokens=MAX_GEN_TOKENS,
+                    do_sample=True,
                     temperature=0.7,
                     top_p=0.95,
-                    do_sample=True,
-                    eos_token_id=_tokenizer.eos_token_id,
-                    pad_token_id=_tokenizer.pad_token_id,
+                    use_cache=True,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
                 )
-            gen_output_text = _tokenizer.decode(gen_outputs[0][gen_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("```cpp", "").replace("```c", "").replace("```", "").strip()
+            gen_output_text = tokenizer.decode(gen_outputs[0][gen_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("```cpp", "").replace("```c", "").replace("```", "").strip()
             print(f"生成的 C 函数代码:\n{gen_output_text}")
             # ========== 编译阶段 ==========
             print("编译 C 函数代码...")

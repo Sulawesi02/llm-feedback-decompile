@@ -2,11 +2,10 @@
 name = "llm-dev-env"
 version = "0.1.0"
 requires-python = ">=3.10"
-
 dependencies = [
-    "torch==2.4.1",
-    "torchvision==0.19.1",
-    "torchaudio==2.4.1",
+    "torch==2.4.0",
+    "torchvision==0.19.0",
+    "torchaudio==2.4.0",
     "tensorboard>=2.20.0",
     "transformers==4.46.3",
     "tensorboardx",
@@ -28,4 +27,5 @@ dependencies = [
     "requests",
     "pycparser",
     "setuptools",
+    "autoawq==0.2.7.post3"
 ]

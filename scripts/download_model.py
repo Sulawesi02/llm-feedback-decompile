@@ -9,11 +9,11 @@ from huggingface_hub import snapshot_download
 
 # 添加项目根目录到 sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from src.config import MODEL_NAME, BASE_MODEL_DIR
+from src.config import MODEL_DIR, MODEL_NAME, AWQ_MODEL_NAME
 
-def download_base_model(repo_id: str, local_dir: Path, max_retries=10):
+def download_model(repo_id: str, local_dir: Path, max_retries=10):
     """
-    下载基座模型，支持自动重试和断点续传
+    下载模型，支持自动重试和断点续传
     """
     local_dir = Path(local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -40,17 +40,29 @@ def download_base_model(repo_id: str, local_dir: Path, max_retries=10):
                 raise RuntimeError(f"模型下载失败，已重试 {max_retries} 次") from e
 
 def main():
-    base_model_path = BASE_MODEL_DIR / MODEL_NAME
+    base_model_path = MODEL_DIR / MODEL_NAME
     base_model_path.mkdir(parents=True, exist_ok=True)
     
     if base_model_path.exists() and (base_model_path / "config.json").exists():
         print(f"{MODEL_NAME} 已存在，跳过下载。")
-        return
+    else:    
+        try:
+            print(f"开始下载 {MODEL_NAME} ...")
+            download_model(MODEL_NAME, base_model_path)
+        except Exception as e:
+            print(f"{MODEL_NAME} 下载失败: {e} !!")
     
-    try:
-        download_base_model(MODEL_NAME, base_model_path)
-    except Exception as e:
-        print(f"{MODEL_NAME} 下载失败: {e} !!")
+    awq_model_path = MODEL_DIR / AWQ_MODEL_NAME
+    awq_model_path.mkdir(parents=True, exist_ok=True)
+    
+    if awq_model_path.exists() and (awq_model_path / "config.json").exists():
+        print(f"{AWQ_MODEL_NAME} 已存在，跳过下载。")
+    else:
+        try:
+            print(f"开始下载 {AWQ_MODEL_NAME} ...")
+            download_model(AWQ_MODEL_NAME, awq_model_path)
+        except Exception as e:
+            print(f"{AWQ_MODEL_NAME} 下载失败: {e} !!")
 
 if __name__ == "__main__":
     main()
