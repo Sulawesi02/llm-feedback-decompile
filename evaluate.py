@@ -1,5 +1,4 @@
 import json
-import sys
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from tqdm import tqdm
@@ -7,52 +6,34 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 from vllm import LLM, SamplingParams, RequestOutput
 
-# 添加项目根目录到 sys.path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import (
     PROCESSED_DATA_DIR,
     EVAL_DIR,
     MODEL_DIR,
-    AWQ_MODEL_NAME,
+    MODEL_NAME,
     DPO_DIR,
-    VERSIONS,
     MAX_PROMPT_TOKENS,
     MAX_GEN_TOKENS,
 )
-from src.compiler import test_func
+from src.compiler import compile_test
 from src.prompts import construct_infer_prompt, construct_fix_prompt
 
-MAX_SAMPLES = 100
 MAX_ITERS = 3
 BATCH_SIZE = 8
-
-_tokenizer = None
-
-def get_tokenizer(awq_model_path: Path):
-    global _tokenizer
-    if _tokenizer is None:
-        _tokenizer = AutoTokenizer.from_pretrained(
-            str(awq_model_path),
-            trust_remote_code=True
-        )
-        _tokenizer.pad_token = _tokenizer.eos_token
-        _tokenizer.padding_side = "right"
-        _tokenizer.truncation_side = "right"
-    return _tokenizer
 
 def evaluate_model(
     version: str,
     test_input: Path,
-    awq_model_path: Path,
-    dpo_adapter_path: Optional[Path],
+    model_path: Path,
+    dpo_dir: Optional[Path],
     eval_output: Path
 ):
-    global _tokenizer
 
     success_count = 0
     total_count = 0
     processed_keys = set()
     existing_results = []
+    skipped_count = 0
 
     # 读取已有记录（支持断点续传）
     if eval_output.exists():
@@ -78,34 +59,43 @@ def evaluate_model(
             print(f"读取现有结果失败: {e}, 将重新开始")
             existing_results = []
 
-    if total_count >= MAX_SAMPLES:
-        print(f"已达到目标记录数 ({MAX_SAMPLES} 条)，跳过评估")
+    test_data = load_dataset("json", data_files=str(test_input), split="train")
+    total_samples = len(test_data)
+    
+    if total_count >= total_samples:
+        print(f"已达到目标记录数 ({total_samples} 条)，跳过评估")
         accuracy = success_count / total_count if total_count > 0 else 0
         print(f"总记录数: {total_count}")
         print(f"成功编译数: {success_count}")
         print(f"编译通过率: {accuracy:.2%}")
         return
 
-    print(f"当前进度: {total_count}/{MAX_SAMPLES}, 继续评估...")
+    print(f"当前进度: {total_count}/{total_samples}, 继续评估...")
 
     print("加载分词器...")
-    _tokenizer = get_tokenizer(awq_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_path),
+        trust_remote_code=True
+    )
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+    tokenizer.truncation_side = "right"
 
     print("初始化 vLLM 引擎...")
     llm = LLM(
-        model=str(awq_model_path),
-        tokenizer=str(awq_model_path),
-        dtype="auto",
+        model=str(model_path),
+        tokenizer=str(model_path),
+        dtype="bfloat16",
         trust_remote_code=True,
-        quantization="awq",
         enable_lora=True,
         max_loras=1,
-        max_lora_rank=8,
-        gpu_memory_utilization=0.95,
+        max_lora_rank=16,
+        gpu_memory_utilization=0.9,
         max_model_len=MAX_PROMPT_TOKENS,
         max_num_seqs=BATCH_SIZE,
         swap_space=4,
         enforce_eager=False,
+        tensor_parallel_size=1,
     )
 
     sampling_params = SamplingParams(
@@ -120,13 +110,10 @@ def evaluate_model(
     else:
         f_out = open(eval_output, "w", encoding="utf-8")
 
-    test_data = load_dataset("json", data_files=str(test_input), split="train")
-    sampled_test = test_data.select(range(MAX_SAMPLES))
-
     # 收集所有待处理样本
     pending_samples: List[Dict[str, Any]] = []
 
-    for item in sampled_test:
+    for item in test_data:
         func_dep = item.get("func_dep")
         func = item.get("func")
         test = item.get("test")
@@ -136,6 +123,19 @@ def evaluate_model(
             continue
 
         if func in processed_keys:
+            continue
+        
+        # 检查样本长度是否超过最大允许长度
+        messages = construct_infer_prompt(asm)
+        prompt_text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        prompt_token_ids = tokenizer.encode(prompt_text)
+        
+        if len(prompt_token_ids) > MAX_PROMPT_TOKENS:
+            skipped_count += 1
             continue
 
         pending_samples.append({
@@ -149,6 +149,7 @@ def evaluate_model(
             "history": [],
             "best_outputs": None,
             "finished": False,
+            "infer_prompt": prompt_text,  # 缓存第一次的 prompt_text
         })
 
     print(f"总待处理样本数: {len(pending_samples)}")
@@ -173,7 +174,7 @@ def evaluate_model(
 
             # 构造当前迭代的 prompt
             if sample["iter"] == 0:
-                messages = construct_infer_prompt(sample["asm"])
+                text = sample["infer_prompt"]
             else:
                 messages = construct_fix_prompt(
                     sample["asm"],
@@ -181,11 +182,11 @@ def evaluate_model(
                     sample["last_error"]
                 )
 
-            text = _tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
+                text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
 
             current_batch.append(sample)
             prompts.append(text)
@@ -197,12 +198,12 @@ def evaluate_model(
         print(f"批量生成 {len(prompts)} 个 prompt...")
 
         lora_request = None
-        if dpo_adapter_path:
+        if dpo_dir:
             from vllm.lora.request import LoRARequest
             lora_request = LoRARequest(
-                lora_name=dpo_adapter_path.name,
+                lora_name=dpo_dir.name,
                 lora_int_id=1,
-                lora_path=str(dpo_adapter_path),
+                lora_path=str(dpo_dir),
             )
 
         # 批量生成
@@ -221,9 +222,9 @@ def evaluate_model(
             generated_text = output.outputs[0].text.strip()
             gen_output_text = generated_text.replace("```cpp", "").replace("```c", "").replace("```", "").strip()
 
-            print(f"生成的 C 函数代码 (样本 {sample['func'][:30]}...):\n{gen_output_text}")
+            # print(f"生成的 C 函数代码 (样本 {sample['func'][:30]}...):\n{gen_output_text}")
 
-            success, error_msg = test_func(sample["func_dep"], gen_output_text, sample["test"])
+            success, error_msg = compile_test(sample["func_dep"], gen_output_text, sample["test"])
 
             sample["history"].append({
                 "iter": sample["iter"],
@@ -271,37 +272,38 @@ def evaluate_model(
     f_out.close()
 
     accuracy = success_count / total_count if total_count > 0 else 0
-    print(f"总样本数: {total_count}")
+    print(f"\n{'='*40}")
+    print(f"评估完成: {version}")
+    print(f"总样本数: {total_samples}")
     print(f"成功编译数: {success_count}")
     print(f"编译通过率: {accuracy:.2%}")
+    print(f"跳过的样本数: {skipped_count}")
+    print(f"实际处理的样本数: {total_count}")
+    print(f"{'='*40}")
 
 def main():
     test_input = PROCESSED_DATA_DIR / "test_data.jsonl"
-    awq_model_path = MODEL_DIR / AWQ_MODEL_NAME
+    model_path = MODEL_DIR / MODEL_NAME
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1. 评估基座模型
     eval_output = EVAL_DIR / "base_model.jsonl"
-    print(f"{'='*50}\n开始评估基座模型\n{'='*50}")
+    print(f"{'='*20}\n开始评估基座模型\n{'='*20}")
     try:
-        evaluate_model("base", test_input, awq_model_path, None, eval_output)
+        evaluate_model("base_model", test_input, model_path, None, eval_output)
     except Exception as e:
         print(f"基座模型评估失败: {e}")
 
-    # 2. 评估各个版本
-    for version, _ in VERSIONS:
-        eval_output = EVAL_DIR / f"{version}.jsonl"
-        dpo_adapter_path = DPO_DIR / version
-
-        if not dpo_adapter_path.exists():
-            print(f"跳过 {version}：DPO 适配器不存在 {dpo_adapter_path}")
-            continue
-
-        print(f"{'='*50}\n开始评估版本: {version}\n{'='*50}")
+    # 2. 评估 DPO 模型
+    eval_output = EVAL_DIR / "dpo_model.jsonl"
+    if not DPO_DIR.exists():
+        print(f"DPO 适配器不存在 {DPO_DIR}，跳过评估")
+    else:
+        print(f"{'='*20}\n开始评估 DPO 模型\n{'='*20}")
         try:
-            evaluate_model(version, test_input, awq_model_path, dpo_adapter_path, eval_output)
+            evaluate_model("dpo_model", test_input, model_path, DPO_DIR, eval_output)
         except Exception as e:
-            print(f"{version} 版本评估失败: {e}")
+            print(f"DPO 模型评估失败: {e}")
 
 if __name__ == "__main__":
     main()

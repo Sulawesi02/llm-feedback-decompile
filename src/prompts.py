@@ -7,7 +7,7 @@ def construct_infer_prompt(asm: str) -> List[Dict[str, str]]:
     messages = [
         {"role": "system", "content": """你是一名专业的 C 语言反编译专家，精通 x86-64 汇编。
 
-你的任务是：根据给定的目标架构和汇编代码，输出一个在语义上完全等价的 C 函数实现。
+你的任务是：根据给定的汇编代码，输出一个在语义上完全等价的 C 函数实现。
 
 输出要求：
 1. 只输出一个完整的 C 函数定义，函数名使用 func0 。

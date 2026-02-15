@@ -1,0 +1,14 @@
+decompile_bench:
+  repo_id: "LLM4Binary/decompile-bench"
+  split: "train"
+  max_samples: 20000
+decompile_eval:
+  repo_id: "LLM4Binary/decompile-eval"
+  split: "train"
+  max_samples: 2000
+  filter:
+    exclude_func_dep_contains: "#define"
+    require_test: true
+    opt_equals: "O0"
+process:
+  train_ratio: 0.9

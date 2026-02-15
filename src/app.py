@@ -13,8 +13,6 @@ from config import (
     MODEL_DIR, 
     MODEL_NAME,
     DPO_DIR,
-    VERSIONS, 
-    QUANT_CONFIG,
     MAX_PROMPT_TOKENS,
     MAX_GEN_TOKENS,
 )
@@ -26,13 +24,11 @@ from compiler import (
 )
 from prompts import construct_infer_prompt, construct_fix_prompt
 
-VERSION = VERSIONS[2][0] # 版本号
 MAX_ITERS = 3 # 最大迭代次数
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     base_model_path = MODEL_DIR / MODEL_NAME
-    dpo_adapter_path = DPO_DIR / VERSION
     
     print("加载分词器...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -47,16 +43,15 @@ async def lifespan(app: FastAPI):
     model = AutoModelForCausalLM.from_pretrained(
         str(base_model_path),
         trust_remote_code=True,
-        quantization_config=QUANT_CONFIG,
         device_map={"": torch.cuda.current_device()},
         torch_dtype=torch.bfloat16,
     )
     
-    if dpo_adapter_path.exists():
-        print(f"加载 DPO 适配器: {dpo_adapter_path}")
+    if DPO_DIR.exists():
+        print(f"加载 DPO 适配器: {DPO_DIR}")
         model = PeftModel.from_pretrained(
             model,
-            str(dpo_adapter_path),
+            str(DPO_DIR),
             device_map={"": torch.cuda.current_device()},
         )
     

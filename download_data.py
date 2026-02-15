@@ -1,11 +1,14 @@
 import json
-from pathlib import Path
-import sys
+import yaml
 from datasets import load_dataset
+from src.config import (
+    RAW_DATA_DIR, 
+    CONFIG_DIR,
+)
 
-# 添加项目根目录到 sys.path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-from src.config import RAW_DATA_DIR
+def load_cfg():
+    with open(CONFIG_DIR / "dataset.yaml", "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 def download_decompile_bench():
     print("\n=== 下载 Decompile-Bench (训练集) ===")
@@ -15,12 +18,14 @@ def download_decompile_bench():
         print(f"文件已存在: {output_file}，跳过下载")
     else:
         try:
-            print("加载 LLM4Binary/decompile-bench 数据集...")
-            dataset = load_dataset("LLM4Binary/decompile-bench", split="train", streaming=True)
+            cfg = load_cfg().get("decompile_bench", {})
+            repo_id = cfg.get("repo_id")
+            split = cfg.get("split")
+            limit = cfg.get("max_samples")
+            print(f"加载 {repo_id} 数据集...")
+            dataset = load_dataset(repo_id, split=split, streaming=True)
             
-            # 尝试加载前 20000 条作为训练数据
             count = 0
-            limit = 20000 
             
             print(f"正在下载并保存 {limit} 条样本...")
             with open(output_file, "w", encoding="utf-8") as f:
@@ -45,18 +50,28 @@ def download_decompile_eval():
         print(f"文件已存在: {output_file}，跳过下载")
     else:
         try:
-            print("加载 LLM4Binary/decompile-eval 数据集...")
-            dataset = load_dataset("LLM4Binary/decompile-eval", split="train", streaming=True)
+            cfg = load_cfg().get("decompile_eval", {})
+            repo_id = cfg.get("repo_id")
+            split = cfg.get("split")
+            limit = cfg.get("max_samples")
+            filt = cfg.get("filter", {})
+            exclude_str = filt.get("exclude_func_dep_contains")
+            require_test = bool(filt.get("require_test", True))
+            opt_equals = filt.get("opt_equals", "O0")
+            print(f"加载 {repo_id} 数据集...")
+            dataset = load_dataset(repo_id, split=split, streaming=True)
             
-            # 尝试加载前 2000 条作为测试数据
             count = 0
-            limit = 2000 
             
             print(f"正在下载并保存 {limit} 条样本...")
             with open(output_file, "w", encoding="utf-8") as f:
                 for item in dataset:
-                    # func_dep不能有”#define”，且 test 不为空，且 opt = O0
-                    if "#define" in str(item.get("func_dep", "")) or not item.get("test") or item.get("opt") != "O0":
+                    func_dep = str(item.get("func_dep", "") or "")
+                    if exclude_str and exclude_str in func_dep:
+                        continue
+                    if require_test and not item.get("test"):
+                        continue
+                    if opt_equals and item.get("opt") != opt_equals:
                         continue
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
                     count += 1

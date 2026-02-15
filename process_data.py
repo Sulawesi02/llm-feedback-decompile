@@ -1,17 +1,21 @@
 import json
-import sys
 import hashlib
 import random
-from pathlib import Path
+import yaml
 from tqdm import tqdm
 from datasets import load_dataset
 
-# 添加项目根目录到 sys.path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import (
     RAW_DATA_DIR, 
     PROCESSED_DATA_DIR, 
+    CONFIG_DIR,
 )
+
+def load_cfg():
+    with open(CONFIG_DIR / "dataset.yaml", "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+TRAIN_RATIO = float(load_cfg().get("process", {}).get("train_ratio"))
 
 def normalize_text(text: str) -> list:
     """
@@ -115,7 +119,7 @@ def main():
             # 划分训练集和验证集 (90% : 10%)
             random.seed(42)
             random.shuffle(formatted_train)
-            split_idx = int(len(formatted_train) * 0.90)
+            split_idx = int(len(formatted_train) * TRAIN_RATIO)
             train_records = formatted_train[:split_idx]
             valid_records = formatted_train[split_idx:]
             

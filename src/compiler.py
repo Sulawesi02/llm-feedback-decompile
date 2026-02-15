@@ -30,7 +30,7 @@ def compile_to_obj(func: str) -> tuple:
         if temp_dir and Path(temp_dir).exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-def test_func(
+def compile_test(
     func_dep: str,
     func: str,
     test: str,

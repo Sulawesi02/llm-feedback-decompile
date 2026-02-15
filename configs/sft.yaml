@@ -1,0 +1,41 @@
+training:
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0003
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  num_train_epochs: 3
+  fp16: false
+  bf16: true
+  optim: adamw_8bit
+  logging_steps: 10
+  save_strategy: steps
+  save_steps: 100
+  eval_strategy: steps
+  eval_steps: 100
+  save_total_limit: 3
+  load_best_model_at_end: true
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  dataloader_num_workers: 4
+  remove_unused_columns: false
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  max_seq_length: 4096
+lora:
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0
+  bias: none
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+chat_template:
+  name: qwen2.5

@@ -1,15 +1,8 @@
 import os
 import time
-import sys
 from pathlib import Path
-
-if "HF_ENDPOINT" not in os.environ:
-    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+from src.config import MODEL_DIR, MODEL_NAME
 from huggingface_hub import snapshot_download
-
-# 添加项目根目录到 sys.path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-from src.config import MODEL_DIR, MODEL_NAME, AWQ_MODEL_NAME
 
 def download_model(repo_id: str, local_dir: Path, max_retries=10):
     """
@@ -52,17 +45,5 @@ def main():
         except Exception as e:
             print(f"{MODEL_NAME} 下载失败: {e} !!")
     
-    awq_model_path = MODEL_DIR / AWQ_MODEL_NAME
-    awq_model_path.mkdir(parents=True, exist_ok=True)
-    
-    if awq_model_path.exists() and (awq_model_path / "config.json").exists():
-        print(f"{AWQ_MODEL_NAME} 已存在，跳过下载。")
-    else:
-        try:
-            print(f"开始下载 {AWQ_MODEL_NAME} ...")
-            download_model(AWQ_MODEL_NAME, awq_model_path)
-        except Exception as e:
-            print(f"{AWQ_MODEL_NAME} 下载失败: {e} !!")
-
 if __name__ == "__main__":
     main()

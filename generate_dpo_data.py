@@ -1,12 +1,8 @@
-import sys
 import json
 import random
-from pathlib import Path
 from tqdm import tqdm
 from datasets import load_dataset
 
-# 添加项目根目录到 sys.path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.config import (
     PROCESSED_DATA_DIR,
     DPO_DATA_DIR,
@@ -87,7 +83,7 @@ def main():
         for item in tqdm(train_data, desc="生成 DPO 训练数据进度"):
             
             entry = {
-                "prompt": f"根据目标架构x86和给定的汇编代码({item['asm']})，输出一个在语义上完全等价的 C 函数实现",
+                "prompt": f"根据给定的汇编代码({item['asm']})，输出一个在语义上完全等价的 C 函数实现",
                 "chosen": item["func"],
                 "rejected": generate_bad_code(item["func"])
             }
@@ -108,7 +104,7 @@ def main():
         formatted_valid = []
         for item in tqdm(valid_data, desc="生成 DPO 验证数据进度"):
             entry = {
-                "prompt": f"根据目标架构x86和给定的汇编代码({item['asm']})，输出一个在语义上完全等价的 C 函数实现",
+                "prompt": f"根据给定的汇编代码({item['asm']})，输出一个在语义上完全等价的 C 函数实现",
                 "chosen": item["func"],
                 "rejected": generate_bad_code(item["func"])
             }

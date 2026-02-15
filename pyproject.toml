@@ -27,5 +27,6 @@ dependencies = [
     "requests",
     "pycparser",
     "setuptools",
-    "autoawq==0.2.7.post3"
+    "unsloth==2025.2.3",
+    "vllm==0.5.4",
 ]
