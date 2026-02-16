@@ -86,7 +86,7 @@ async def decompile(request: Request, body: DecompileRequest):
     
     machine_code = body.machine_code
     
-    gen_outputs = None
+    outputs = None
     prev_outputs = None
     last_error = None
     
@@ -104,39 +104,33 @@ async def decompile(request: Request, body: DecompileRequest):
             # ========== 生成阶段 ==========
             if it == 0:
                 print("构造推理提示...")
-                gen_messages = construct_infer_prompt(asm)
+                messages = construct_infer_prompt(asm)
             else:
                 print("构造修复提示...")
-                gen_messages = construct_fix_prompt(asm, prev_outputs, last_error)
-            gen_text = tokenizer.apply_chat_template(gen_messages, tokenize=False, add_generation_prompt=True)            
-
-            gen_inputs_check = tokenizer(
-                gen_text, 
-                return_tensors="pt", 
-                truncation=False
-            )
-            gen_prompt_tokens = gen_inputs_check.input_ids.shape[1]
-            if gen_prompt_tokens > MAX_PROMPT_TOKENS:
-                print(f"输入长度 {gen_prompt_tokens} 超过最大长度")
-                error_msg = f"生成提示过长: {gen_prompt_tokens} tokens"
+                messages = construct_fix_prompt(asm, prev_outputs, last_error)
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)            
+            token_count = len(tokenizer.encode(text))
+            
+            if token_count > MAX_PROMPT_TOKENS:
+                print(f"输入长度 {token_count} 超过最大长度")
                 history.append({
                     "iter": it,
                     "success": False,
                     "outputs": "",
-                    "error": error_msg,
+                    "error": f"prompt too long ({token_count} > {MAX_PROMPT_TOKENS})"
                 })
                 break
             
             gen_inputs = tokenizer(
-                gen_text, 
+                text, 
                 return_tensors="pt", 
                 truncation=True, 
-                max_length=gen_prompt_tokens
+                max_length=MAX_PROMPT_TOKENS,
             ).to(model.device)
 
             print("生成 C 函数代码...")
             with torch.no_grad():
-                gen_outputs = model.generate(
+                outputs = model.generate(
                     **gen_inputs,
                     max_new_tokens=MAX_GEN_TOKENS,
                     do_sample=True,
@@ -146,18 +140,18 @@ async def decompile(request: Request, body: DecompileRequest):
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                 )
-            gen_output_text = tokenizer.decode(gen_outputs[0][gen_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("```cpp", "").replace("```c", "").replace("```", "").strip()
-            print(f"生成的 C 函数代码:\n{gen_output_text}")
+            output_text = tokenizer.decode(outputs[0][gen_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("```cpp", "").replace("```c", "").replace("```", "").strip()
+            print(f"生成的 C 函数代码:\n{output_text}")
             # ========== 编译阶段 ==========
             print("编译 C 函数代码...")
-            success, error_msg = compile_to_obj(gen_output_text)
+            success, error_msg = compile_to_obj(output_text)
             if success:
                 print("编译成功")
-                best_outputs = gen_output_text
+                best_outputs = output_text
                 history.append({
                     "iter": it,
                     "success": True,
-                    "gen_outputs": gen_output_text,
+                    "outputs": output_text,
                     "error": "",
                 })
                 break
@@ -166,10 +160,10 @@ async def decompile(request: Request, body: DecompileRequest):
                 history.append({
                     "iter": it,
                     "success": False,
-                    "gen_outputs": gen_output_text,
+                    "outputs": output_text,
                     "error": error_msg,
                 })
-                prev_outputs = gen_output_text
+                prev_outputs = output_text
                 last_error = error_msg
                 continue
         except Exception as e:
@@ -177,7 +171,7 @@ async def decompile(request: Request, body: DecompileRequest):
             history.append({
                 "iter": it,
                 "success": False,
-                "gen_outputs": "",
+                "outputs": "",
                 "error": f"生成 C 函数代码出错: {e}",
             })
             break

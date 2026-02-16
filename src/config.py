@@ -24,6 +24,9 @@ DPO_DIR = ADAPTER_DIR / "dpo"
 
 # 评估目录
 EVAL_DIR = PROJECT_ROOT / "eval"
+BASE_EVAL_DIR = EVAL_DIR / "base_model"
+SFT_EVAL_DIR = EVAL_DIR / "sft_model"
+DPO_EVAL_DIR = EVAL_DIR / "dpo_model"
 
 MAX_PROMPT_TOKENS = 4096 # 最大提示 tokens 数
 MAX_GEN_TOKENS = 512 # 最大生成 tokens 数

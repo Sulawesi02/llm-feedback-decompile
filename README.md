@@ -60,7 +60,7 @@ python download_data.py
   "ghidra_pseudo":"decompiled results (pseudo code) from ghidra"
 }
 ```
-  - 原始数据保存到 `data/raw_data` 目录。
+  - 原始数据保存到 `data/raw_data` 。
 
 ### 2. 数据处理
 ```bash
@@ -70,7 +70,7 @@ python process_data.py
 - decompile-bench 提取 func 和 asm，并按比例划分训练集和验证集；
 - decompile-eval 提取 func_dep、func、test 和 asm；
 - 通过计算代码的 MinHash 并利用局部敏感哈希（LSH）删除重复样本；
-- 去重后的数据保存到 `data/processed_data` 目录。
+- 去重后的数据保存到 `data/processed_data` 。
 - 处理后的数据格式
   - decompile-bench
 ```json
@@ -144,9 +144,8 @@ python train_dpo.py
 python evaluate.py
 ```
 
-- 加载 **基座模型** ，挂载 **DPO 适配器**。
-- 在测试集上评估反编译测试成功率。
-- 结果保存到 `eval/<版本>.jsonl`。
+- 在测试集上评估反编译测试成功率，量化引入编译器反馈循环与 DPO 对齐前后的差异。
+- 评估结果统一保存到 `eval/` 目录，支持对不同模型版本和配置进行对比分析。
 
 ## 启动 Web 服务
 ```bash

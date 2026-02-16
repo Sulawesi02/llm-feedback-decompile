@@ -95,8 +95,9 @@ def main():
     train_output = PROCESSED_DATA_DIR / "train_data.jsonl"
     valid_output = PROCESSED_DATA_DIR / "valid_data.jsonl"
     
-    if train_input.exists():
-        print(f"训练数据文件已存在: {train_input}")
+    if train_output.exists() and valid_output.exists():
+        print(f"训练数据文件已存在: {train_output}")
+        print(f"验证数据文件已存在: {valid_output}")
     else:
         train_data = load_dataset("json", data_files=str(train_input), split="train")
         print("格式化训练数据...")
@@ -140,14 +141,15 @@ def main():
     test_input = RAW_DATA_DIR / "test_data.jsonl"
     test_output = PROCESSED_DATA_DIR / "test_data.jsonl"
     
-    if test_input.exists():
-        print(f"测试数据文件已存在: {test_input}")
+    if test_output.exists():
+        print(f"测试数据文件已存在: {test_output}")
     else:
         valid_data = load_dataset("json", data_files=str(test_input), split="train")
         print("格式化测试数据...")
         formatted_train = []
         for item in tqdm(valid_data, desc="格式化测试数据"):
             data = {
+                "index": item["index"],
                 "func_dep": item["func_dep"],
                 "func": item["func"],
                 "test": item["test"],
