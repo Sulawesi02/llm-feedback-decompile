@@ -8,8 +8,6 @@ def download_model(repo_id: str, local_dir: Path, max_retries=10):
     """
     下载模型，支持自动重试和断点续传
     """
-    local_dir = Path(local_dir)
-    local_dir.mkdir(parents=True, exist_ok=True)
     
     for i in range(max_retries):
         try:
@@ -36,7 +34,7 @@ def main():
     base_model_path = MODEL_DIR / MODEL_NAME
     base_model_path.mkdir(parents=True, exist_ok=True)
     
-    if base_model_path.exists() and (base_model_path / "config.json").exists():
+    if (base_model_path / "config.json").exists():
         print(f"{MODEL_NAME} 已存在，跳过下载。")
     else:    
         try:

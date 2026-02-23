@@ -149,11 +149,10 @@ def main():
         formatted_train = []
         for item in tqdm(valid_data, desc="格式化测试数据"):
             data = {
-                "index": item["index"],
                 "func_dep": item["func_dep"],
                 "func": item["func"],
                 "test": item["test"],
-                "asm": item["asm"]
+                "asm": item["asm"],
             }
             formatted_train.append(data)
         
@@ -166,8 +165,15 @@ def main():
             formatted_train = dedup_records
         
         with open(test_output, "w", encoding="utf-8") as f:
-            for rec in formatted_train:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            for new_idx, rec in enumerate(formatted_train):
+                out = {
+                    "index": new_idx,
+                    "func_dep": rec["func_dep"],
+                    "func": rec["func"],
+                    "test": rec["test"],
+                    "asm": rec["asm"],
+                }
+                f.write(json.dumps(out, ensure_ascii=False) + "\n")
         print(f"  已保存测试集: {test_output}")
     
     print("\n数据集处理完成！")

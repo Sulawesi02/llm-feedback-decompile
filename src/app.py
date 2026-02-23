@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pathlib import Path
 from contextlib import asynccontextmanager
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 
 from config import (
@@ -16,13 +16,9 @@ from config import (
     MAX_PROMPT_TOKENS,
     MAX_GEN_TOKENS,
 )
-from compiler import ( 
-    write_machine_code_to_bin,
-    disasm_bin,
-    extract_asm,
-    compile_to_obj,
-)
-from prompts import construct_infer_prompt, construct_fix_prompt
+from compiler import write_machine_code_to_bin, disasm_bin, extract_asm, compile_test_compare, compile_to_obj
+from llm_utils import clean_output
+from prompts import build_generate_text, build_test_text
 
 MAX_ITERS = 3 # 最大迭代次数
 
@@ -38,17 +34,25 @@ async def lifespan(app: FastAPI):
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     tokenizer.truncation_side = "right"
+
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
     
     print("加载模型...")
     model = AutoModelForCausalLM.from_pretrained(
         str(base_model_path),
         trust_remote_code=True,
         device_map={"": torch.cuda.current_device()},
+        quantization_config=quant_config,
         torch_dtype=torch.bfloat16,
     )
     
     if DPO_DIR.exists():
-        print(f"加载 DPO 适配器: {DPO_DIR}")
+        print(f"挂载 DPO 适配器: {DPO_DIR}")
         model = PeftModel.from_pretrained(
             model,
             str(DPO_DIR),
@@ -86,7 +90,7 @@ async def decompile(request: Request, body: DecompileRequest):
     
     machine_code = body.machine_code
     
-    outputs = None
+    best_outputs = None
     prev_outputs = None
     last_error = None
     
@@ -102,27 +106,22 @@ async def decompile(request: Request, body: DecompileRequest):
             disasm_result = disasm_bin(bin_path)
             asm = extract_asm(disasm_result)
             # ========== 生成阶段 ==========
-            if it == 0:
-                print("构造推理提示...")
-                messages = construct_infer_prompt(asm)
-            else:
-                print("构造修复提示...")
-                messages = construct_fix_prompt(asm, prev_outputs, last_error)
-            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)            
-            token_count = len(tokenizer.encode(text))
-            
-            if token_count > MAX_PROMPT_TOKENS:
-                print(f"输入长度 {token_count} 超过最大长度")
+            sample = {
+                "asm": asm,
+                "prev_outputs": prev_outputs,
+                "last_error": last_error,
+            }
+            gen_text = build_generate_text(it, tokenizer, sample, MAX_PROMPT_TOKENS)
+            if gen_text is None:
                 history.append({
                     "iter": it,
                     "success": False,
                     "outputs": "",
-                    "error": f"prompt too long ({token_count} > {MAX_PROMPT_TOKENS})"
+                    "error": "generate prompt too long",
                 })
                 break
-            
             gen_inputs = tokenizer(
-                text, 
+                gen_text, 
                 return_tensors="pt", 
                 truncation=True, 
                 max_length=MAX_PROMPT_TOKENS,
@@ -130,7 +129,7 @@ async def decompile(request: Request, body: DecompileRequest):
 
             print("生成 C 函数代码...")
             with torch.no_grad():
-                outputs = model.generate(
+                gen_outputs = model.generate(
                     **gen_inputs,
                     max_new_tokens=MAX_GEN_TOKENS,
                     do_sample=True,
@@ -140,13 +139,60 @@ async def decompile(request: Request, body: DecompileRequest):
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                 )
-            output_text = tokenizer.decode(outputs[0][gen_inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("```cpp", "").replace("```c", "").replace("```", "").strip()
+            gen_outputs = tokenizer.decode(gen_outputs[0][gen_inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            output_text = clean_output(gen_outputs)
             print(f"生成的 C 函数代码:\n{output_text}")
-            # ========== 编译阶段 ==========
-            print("编译 C 函数代码...")
-            success, error_msg = compile_to_obj(output_text)
+            
+            func_ok, func_error = compile_to_obj(output_text)
+            if not func_ok:
+                print(f"候选 C 函数编译失败: {func_error.splitlines()[0]}")
+                history.append({
+                    "iter": it,
+                    "success": False,
+                    "outputs": output_text,
+                    "error": f"func 编译失败: {func_error}",
+                })
+                prev_outputs = output_text
+                last_error = f"func 编译失败: {func_error}"
+                continue
+            
+            test_text = build_test_text(tokenizer, output_text, MAX_PROMPT_TOKENS)
+            if test_text is None:
+                history.append({
+                    "iter": it,
+                    "success": False,
+                    "outputs": output_text,
+                    "error": "test prompt too long",
+                })
+                prev_outputs = output_text
+                last_error = "test prompt too long"
+                continue
+            test_inputs = tokenizer(
+                test_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=MAX_PROMPT_TOKENS,
+            ).to(model.device)
+            
+            print("生成测试代码...")
+            with torch.no_grad():
+                test_outputs = model.generate(
+                    **test_inputs,
+                    max_new_tokens=MAX_GEN_TOKENS,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.95,
+                    use_cache=True,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            test_output = tokenizer.decode(test_outputs[0][test_inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            test_code = clean_output(test_output)
+            print(f"生成的测试代码:\n{test_code}")
+            print("编译并运行测试用例...")
+            success, error_msg = compile_test_compare(asm, output_text, test_code)
             if success:
-                print("编译成功")
+                print("测试通过")
                 best_outputs = output_text
                 history.append({
                     "iter": it,

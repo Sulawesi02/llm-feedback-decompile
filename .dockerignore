@@ -1,4 +1,4 @@
-# === 版本控制和编辑器垃圾 ===
+# 版本控制和编辑器垃圾
 .git
 .gitignore
 .gitattributes
@@ -8,7 +8,7 @@
 .DS_Store
 Thumbs.db
 
-# === Python 缓存和字节码 ===
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -22,7 +22,7 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
-# === 虚拟环境和依赖缓存 ===
+# 虚拟环境和依赖缓存
 .venv/
 venv/
 env/
@@ -30,10 +30,11 @@ env/
 pip-log.txt
 pip-delete-this-directory.txt
 
-# === 大型数据/模型/输出 ===
+# 大型数据/模型/输出
 data/
 model/
-outputs/
+adapter/
+eval/
 experiments/
 checkpoints/
 logs/
@@ -46,7 +47,7 @@ wandb/
 *.gguf
 *.onnx
 
-# === 敏感/配置/秘密文件 ===
+# 敏感/配置/秘密文件
 .env
 .env.*
 *.key
@@ -57,7 +58,7 @@ wandb/
 config.yaml.secret
 secrets/
 
-# === 测试/临时文件 ===
+# 测试/临时文件
 tests/__pycache__/
 tmp/
 temp/
@@ -67,7 +68,7 @@ temp/
 *.swp
 *.swo
 
-# === 构建/打包产物 ===
+# 构建/打包产物
 build/
 dist/
 *.egg-info/
@@ -75,10 +76,18 @@ dist/
 *.tar.gz
 *.zip
 
-# === 其他常见垃圾 ===
+# 其他常见垃圾
 npm-debug.log
 yarn-error.log
 yarn-debug.log
 .DS_Store
 .AppleDouble
 .LSOverride
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.trae/
+.uv/
+/tmp/
+htmlcov/

@@ -20,7 +20,7 @@ training:
   metric_for_best_model: eval_rewards/chosen
   dataloader_num_workers: 8
   dataloader_pin_memory: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   gradient_checkpointing_use_reentrant: false
   max_grad_norm: 1.0
   max_length: 2048

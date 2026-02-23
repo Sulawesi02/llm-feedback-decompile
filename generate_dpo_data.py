@@ -1,59 +1,111 @@
 import json
 import random
+from pathlib import Path
+from typing import List, Optional
 from tqdm import tqdm
 from datasets import load_dataset
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
+from transformers import AutoTokenizer
 
 from src.config import (
     PROCESSED_DATA_DIR,
     DPO_DATA_DIR,
+    MODEL_DIR,
+    MODEL_NAME,
+    SFT_DIR,
+    BATCH_SIZE,
+    MAX_PROMPT_TOKENS,
+    MAX_GEN_TOKENS,
 )
+from src.llm_utils import init_engine, clean_output
+from src.compiler import compile_to_obj
+from src.prompts import build_generate_text
 
-def generate_bad_code(func: str) -> str:
-    """
-    通过简单的规则扰动生成错误代码
-    """
-    lines = func.splitlines()
-    if not lines:
-        return func
-        
-    mutation_type = random.choice(["delete", "swap", "modify_op", "modify_num"])
+NUM_CANDIDATES = 3
+
+def generate_dpo_entries(
+    input_path: Path,
+    llm: LLM,
+    tokenizer: AutoTokenizer,
+    sampling_params: SamplingParams,
+    lora_request: Optional[LoRARequest],
+    output_path: Path,
+    desc: str,
+):
+    if output_path.exists():
+        print(f"DPO 数据文件已存在，跳过生成: {output_path}")
+        return
     
+    dataset = load_dataset("json", data_files=str(input_path), split="train")
+    total_samples = len(dataset)
+    print(f"总样本数: {total_samples}...")
+
     try:
-        if mutation_type == "delete" and len(lines) > 2:
-            # 随机删除一行非空行（避开开头结尾）
-            idx = random.randint(1, len(lines) - 2)
-            lines.pop(idx)
-            
-        elif mutation_type == "swap" and len(lines) > 3:
-            # 随机交换两行
-            idx1 = random.randint(1, len(lines) - 2)
-            idx2 = random.randint(1, len(lines) - 2)
-            lines[idx1], lines[idx2] = lines[idx2], lines[idx1]
-            
-        elif mutation_type == "modify_op":
-            # 替换运算符
-            code_str = "\n".join(lines)
-            ops = [("+", "-"), ("*", "/"), ("==", "!="), (">", "<"), ("&", "|")]
-            op = random.choice(ops)
-            if op[0] in code_str:
-                code_str = code_str.replace(op[0], op[1], 1)
-                return code_str
-                
-        elif mutation_type == "modify_num":
-            # 修改数字
-            code_str = "\n".join(lines)
-            import re
-            nums = re.findall(r'\b\d+\b', code_str)
-            if nums:
-                target = random.choice(nums)
-                new_num = str(int(target) + random.randint(1, 10))
-                code_str = code_str.replace(target, new_num, 1)
-                return code_str
-                
-    except Exception:
-        pass
-        
-    return "\n".join(lines)
+        data_list = list(dataset)
+        max_entries = max(1, int(total_samples * 0.2))
+        entries = []
+        pbar = tqdm(total=max_entries, desc=desc)
+        stop = False
+        for start in range(0, len(data_list), BATCH_SIZE):
+            prompts: List[str] = []
+            func_list: List[str] = []
+            asm_list: List[str] = []
+            for item in data_list[start : start + BATCH_SIZE]:
+                func = item.get("func")
+                asm = item.get("asm")
+                if not all([func, asm]):
+                    continue
+                text = build_generate_text(iter=0, tokenizer=tokenizer, sample=item, max_prompt_tokens=MAX_PROMPT_TOKENS)
+                if not text:
+                    continue
+                prompts.append(text)
+                func_list.append(func)
+                asm_list.append(asm)
+            if not prompts:
+                continue
+            outputs = llm.generate(
+                prompts,
+                sampling_params,
+                lora_request=lora_request,
+            )
+            for func, asm, request_output in zip(func_list, asm_list, outputs):
+                candidates: List[str] = []
+                for out in request_output.outputs:
+                    text = clean_output(out.text)
+                    if text:
+                        candidates.append(text)
+                if not candidates:
+                    continue
+                bad_candidates: List[str] = []
+                for cand in candidates:
+                    success, _ = compile_to_obj(cand)
+                    if not success:
+                        bad_candidates.append(cand)
+                if not bad_candidates:
+                    continue
+                rejected = random.choice(bad_candidates)
+                entry = {
+                    "prompt": f"根据给定的汇编代码({asm})，输出一个在语义上完全等价的 C 函数实现",
+                    "chosen": func,
+                    "rejected": rejected,
+                }
+                entries.append(entry)
+                pbar.update(1)
+                if len(entries) >= max_entries:
+                    stop = True
+                    break
+            if stop:
+                break
+        pbar.close()
+        if entries:
+            with open(output_path, "w", encoding="utf-8") as f:
+                for entry in entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"生成 DPO 数据时出错: {e}")
+        import traceback
+        traceback.print_exc()
 
 def main():
     train_input = PROCESSED_DATA_DIR / "train_data.jsonl"
@@ -66,55 +118,60 @@ def main():
         print(f"错误: 验证集不存在: {valid_input}")
         return
     
-    train_output = DPO_DATA_DIR / "train_data.jsonl"
-    valid_output = DPO_DATA_DIR / "valid_data.jsonl"
+    model_path = MODEL_DIR / MODEL_NAME
+    llm, tokenizer = init_engine(model_path, MAX_PROMPT_TOKENS, BATCH_SIZE)
 
-    if train_output.exists() and valid_output.exists():
-        print("DPO 训练数据和验证数据均已存在，跳过处理。")
+    sampling_params = SamplingParams(
+        temperature=0.7,
+        top_p=0.95,
+        max_tokens=MAX_GEN_TOKENS,
+        skip_special_tokens=True,
+        n=NUM_CANDIDATES,
+    )
+
+    lora_request: Optional[LoRARequest] = None
+    if SFT_DIR.exists():
+        lora_request = LoRARequest(
+            lora_name=SFT_DIR.name,
+            lora_int_id=1,
+            lora_path=str(SFT_DIR),
+        )
+    
+    DPO_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. 生成 DPO 训练数据
+    print(f"{'='*20}\n开始生成 DPO 训练数据\n{'='*20}")
+    train_output = DPO_DATA_DIR / "train_data.jsonl"
+    try:
+        generate_dpo_entries(
+            train_input,
+            llm,
+            tokenizer,
+            sampling_params,
+            lora_request,
+            train_output,
+            "生成 DPO 训练数据进度",
+        )
+    except Exception as e:
+        print(f"生成 DPO 训练数据时出错: {e}")
         return
 
-    if train_output.exists():    
-        print("训练数据已存在，跳过生成。")
-    else:
-        print(f"加载训练数据集: {train_input}")
-        train_data = load_dataset("json", data_files=str(train_input), split="train")
-        print("格式化训练数据...")
-        formatted_train = []
-        for item in tqdm(train_data, desc="生成 DPO 训练数据进度"):
-            
-            entry = {
-                "prompt": f"根据给定的汇编代码({item['asm']})，输出一个在语义上完全等价的 C 函数实现",
-                "chosen": item["func"],
-                "rejected": generate_bad_code(item["func"])
-            }
-            formatted_train.append(entry)
-
-        print("保存训练数据...")
-        with open(train_output, "w", encoding="utf-8") as f:
-            for entry in formatted_train:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        print(f"保存 {len(formatted_train)} 条训练数据到 {train_output}")
-    
-    if valid_output.exists():
-        print(f"验证数据已存在，跳过: {valid_output}")
-    else:
-        print(f"加载验证数据集: {valid_input}")
-        valid_data = load_dataset("json", data_files=str(valid_input), split="train")
-        print("格式化验证数据...")
-        formatted_valid = []
-        for item in tqdm(valid_data, desc="生成 DPO 验证数据进度"):
-            entry = {
-                "prompt": f"根据给定的汇编代码({item['asm']})，输出一个在语义上完全等价的 C 函数实现",
-                "chosen": item["func"],
-                "rejected": generate_bad_code(item["func"])
-            }
-            formatted_valid.append(entry)
-    
-        print("保存验证数据...")
-        with open(valid_output, "w", encoding="utf-8") as f:
-            for entry in formatted_valid:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        print(f"保存 {len(formatted_valid)} 条验证数据到 {valid_output}")
+    # 2. 生成 DPO 验证数据
+    print(f"{'='*20}\n开始生成 DPO 验证数据\n{'='*20}")
+    valid_output = DPO_DATA_DIR / "valid_data.jsonl"
+    try:
+        generate_dpo_entries(
+            valid_input,
+            llm,
+            tokenizer,
+            sampling_params,
+            lora_request,
+            valid_output,
+            "生成 DPO 验证数据进度",
+        )
+    except Exception as e:
+        print(f"生成 DPO 验证数据时出错: {e}")
+        return
 
 if __name__ == "__main__":
     main()

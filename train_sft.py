@@ -19,31 +19,29 @@ def load_sft_cfg():
     with open(CONFIG_DIR / "sft.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-def train_sft(base_model_path, SFT_DIR):
-    print(f"{'='*20} 开始训练 SFT 适配器 {'='*20}")
+def train_sft(base_model_path, sft_dir):
     cfg = load_sft_cfg()
     tcfg = cfg.get("training", {}) if cfg else {}
     lcfg = cfg.get("lora", {}) if cfg else {}
     ctcfg = cfg.get("chat_template", {}) if cfg else {}
     max_seq_len = int(tcfg.get("max_seq_length", MAX_PROMPT_TOKENS))
     
-    
     print("加载分词器和基座模型...")
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = str(base_model_path),
-        max_seq_length = max_seq_len,
-        dtype = None,
-        load_in_4bit = True,
+        model_name=str(base_model_path),
+        max_seq_length=max_seq_len,
+        dtype=None,
+        load_in_4bit=True,
         device_map="auto",
     )
 
     print("设置 Qwen2.5 聊天模板...")
     tokenizer = get_chat_template(
         tokenizer,
-        chat_template = ctcfg.get("name", "qwen2.5"),
+        chat_template=ctcfg.get("name", "qwen2.5"),
     )
     
-    print("配置 PEFT 模型...")
+    print("挂载 SFT 适配器...")
     model = FastLanguageModel.get_peft_model(
         model,
         r = int(lcfg.get("r", 8)),
@@ -90,7 +88,7 @@ def train_sft(base_model_path, SFT_DIR):
         max_seq_length=max_seq_len,
         packing=False,
         args=SFTConfig(
-            output_dir=str(SFT_DIR),
+            sft_dir=str(sft_dir),
             per_device_train_batch_size=int(tcfg.get("per_device_train_batch_size", 1)),
             per_device_eval_batch_size=int(tcfg.get("per_device_eval_batch_size", 1)),
             gradient_accumulation_steps=int(tcfg.get("gradient_accumulation_steps", 8)),
@@ -121,7 +119,7 @@ def train_sft(base_model_path, SFT_DIR):
     print(f"开始 SFT 训练...")
     
     # 检查是否有 checkpoint 用于恢复训练
-    last_checkpoint = get_last_checkpoint(str(SFT_DIR))
+    last_checkpoint = get_last_checkpoint(str(sft_dir))
     if last_checkpoint is not None:
         print(f"发现已有 SFT checkpoint: {last_checkpoint}")
         trainer.train(resume_from_checkpoint=last_checkpoint)
@@ -129,7 +127,7 @@ def train_sft(base_model_path, SFT_DIR):
         trainer.train()
 
     print(f"保存 LoRA 适配器...")
-    trainer.save_model(SFT_DIR)
+    trainer.save_model(sft_dir)
     
     # 清理资源
     del model, tokenizer, trainer
@@ -137,9 +135,11 @@ def train_sft(base_model_path, SFT_DIR):
     torch.cuda.empty_cache()
 
 def main():
+    
     base_model_path = MODEL_DIR / MODEL_NAME
     SFT_DIR.mkdir(parents=True, exist_ok=True)
     
+    print(f"{'='*20} 开始训练 SFT 适配器 {'='*20}")
     try:
         train_sft(base_model_path, SFT_DIR)
     except Exception as e:

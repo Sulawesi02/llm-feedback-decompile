@@ -22,9 +22,7 @@ def load_dpo_cfg():
     with open(CONFIG_DIR / "dpo.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-def train_dpo(base_model_path, SFT_DIR, DPO_DIR):
-    print(f"{'='*20} 开始训练 DPO 适配器 {'='*20}")
-
+def train_dpo(base_model_path, sft_dir, dpo_dir):
     cfg = load_dpo_cfg()
     tcfg = cfg.get("training", {}) if cfg else {}
     lcfg = cfg.get("lora", {}) if cfg else {}
@@ -33,41 +31,41 @@ def train_dpo(base_model_path, SFT_DIR, DPO_DIR):
 
     print("加载分词器和基座模型...")
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = str(base_model_path),
-        max_seq_length = max_seq_len,
-        dtype = None,
-        load_in_4bit = True,
+        model_name=str(base_model_path),
+        max_seq_length=max_seq_len,
+        dtype=None,
+        load_in_4bit=True,
         device_map="auto",
     )
     
     print("设置 Qwen2.5 聊天模板...")
     tokenizer = get_chat_template(
         tokenizer,
-        chat_template = ctcfg.get("name", "qwen2.5"),
+        chat_template=ctcfg.get("name", "qwen2.5"),
     )
     
-    # 加载 SFT 适配器
-    if SFT_DIR.exists():
-        print(f"加载 SFT 适配器: {SFT_DIR}")
+    # 在 SFT 适配器基础上继续训练
+    if sft_dir.exists():
+        print(f"加载并继续微调 SFT 适配器: {sft_dir}")
         model = PeftModel.from_pretrained(
             model,
-            str(SFT_DIR),
+            str(sft_dir),
             device_map={"": torch.cuda.current_device()},
             is_trainable=True,
         )
-    
-    print("配置 LoRA 参数...")
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=int(lcfg.get("r", 8)),
-        target_modules=lcfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]),
-        lora_alpha=int(lcfg.get("lora_alpha", 16)),
-        lora_dropout=float(lcfg.get("lora_dropout", 0)),
-        bias=str(lcfg.get("bias", "none")),
-        use_gradient_checkpointing="unsloth",
-        random_state=42,
-        max_seq_length=max_seq_len,
-    )
+    else:
+        print("未找到 SFT 适配器，直接初始化 DPO LoRA 适配器")
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=int(lcfg.get("r", 8)),
+            target_modules=lcfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]),
+            lora_alpha=int(lcfg.get("lora_alpha", 16)),
+            lora_dropout=float(lcfg.get("lora_dropout", 0)),
+            bias=str(lcfg.get("bias", "none")),
+            use_gradient_checkpointing="unsloth",
+            random_state=42,
+            max_seq_length=max_seq_len,
+        )
     
     print("加载数据集...")
     train_data = load_dataset("json", data_files=str(DPO_DATA_DIR / "train_data.jsonl"), split="train")
@@ -83,7 +81,7 @@ def train_dpo(base_model_path, SFT_DIR, DPO_DIR):
         train_dataset=train_data,
         eval_dataset=valid_data,
         args=DPOConfig(
-            output_dir=str(DPO_DIR),
+            output_dir=str(dpo_dir),
             per_device_train_batch_size=int(tcfg.get("per_device_train_batch_size", 1)),
             per_device_eval_batch_size=int(tcfg.get("per_device_eval_batch_size", 1)),
             gradient_accumulation_steps=int(tcfg.get("gradient_accumulation_steps", 8)),
@@ -117,18 +115,18 @@ def train_dpo(base_model_path, SFT_DIR, DPO_DIR):
     
     print(f"开始 DPO 训练...")
     # 检查是否有 checkpoint
-    last_checkpoint = get_last_checkpoint(str(DPO_DIR))
+    last_checkpoint = get_last_checkpoint(str(dpo_dir))
     if last_checkpoint is not None:
         print(f"发现已有 DPO checkpoint: {last_checkpoint}")
         trainer.train(resume_from_checkpoint=last_checkpoint)
     else:
         trainer.train()
     
-    print(f"保存 DPO 适配器...")
-    trainer.save_model(DPO_DIR)
+    print(f"保存 DPO 适配器（SFT + DPO 的组合效果）...")
+    trainer.save_model(dpo_dir)
     
     # 清理资源
-    del model, trainer
+    del model, tokenizer, trainer
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -136,6 +134,7 @@ def main():
     base_model_path = MODEL_DIR / MODEL_NAME 
     DPO_DIR.mkdir(parents=True, exist_ok=True)
     
+    print(f"{'='*20} 开始训练 DPO 适配器 {'='*20}")
     try:
         train_dpo(base_model_path, SFT_DIR, DPO_DIR)
     except Exception as e:

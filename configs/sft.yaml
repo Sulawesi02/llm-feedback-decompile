@@ -22,7 +22,7 @@ training:
   dataloader_num_workers: 4
   remove_unused_columns: false
   max_grad_norm: 1.0
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   max_seq_length: 4096
 lora:
   r: 8

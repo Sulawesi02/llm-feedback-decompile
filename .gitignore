@@ -58,3 +58,14 @@ logs/
 *.bin
 *.safetensors
 *.onnx
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+wandb/
+tensorboard/
+experiments/
+checkpoints/

@@ -30,6 +30,88 @@ def compile_to_obj(func: str) -> tuple:
         if temp_dir and Path(temp_dir).exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+def compile_test_compare(
+    asm: str,
+    func: str,
+    test: str,
+) -> tuple:
+    """
+    将候选 C 函数和汇编函数分别与测试代码链接、运行并比较结果
+    """
+    temp_dir = tempfile.mkdtemp(prefix="test_")
+    try:        
+        func_path = Path(temp_dir) / "func.c"
+        func_path.write_text(func, encoding="utf-8")
+
+        test_path = Path(temp_dir) / "test.c"
+        test_path.write_text(test, encoding="utf-8")
+
+        c_exe_path = Path(temp_dir) / "program_c"
+        compile_c_cmd = [
+            "gcc",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            str(func_path),
+            str(test_path),
+            "-o",
+            str(c_exe_path),
+        ]
+        compile_c_result = subprocess.run(compile_c_cmd, capture_output=True, text=True, timeout=10)
+        if compile_c_result.returncode != 0:
+            error_msg = compile_c_result.stderr.strip() or compile_c_result.stdout.strip() or "C 版本未知编译错误"
+            return False, f"C版本编译失败: {error_msg}"
+
+        run_c_result = subprocess.run([str(c_exe_path)], capture_output=True, text=True, timeout=5)
+        if run_c_result.returncode != 0:
+            error_msg = run_c_result.stderr.strip() or run_c_result.stdout.strip() or "C 版本未知运行错误"
+            return False, f"C版本运行失败: {error_msg}"
+
+        if not asm:
+            return True, None
+
+        asm_lines = [line.strip() for line in asm.splitlines() if line.strip()]
+        asm_body = "\n".join(f"    {line}" for line in asm_lines)
+        asm_source = f""".text
+.globl func0
+func0:
+{asm_body}
+"""
+        asm_path = Path(temp_dir) / "func0.s"
+        asm_path.write_text(asm_source, encoding="utf-8")
+
+        asm_exe_path = Path(temp_dir) / "program_asm"
+        compile_asm_cmd = [
+            "gcc",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            str(test_path),
+            str(asm_path),
+            "-o",
+            str(asm_exe_path),
+        ]
+        compile_asm_result = subprocess.run(compile_asm_cmd, capture_output=True, text=True, timeout=10)
+        if compile_asm_result.returncode != 0:
+            error_msg = compile_asm_result.stderr.strip() or compile_asm_result.stdout.strip() or "ASM 版本未知编译错误"
+            return False, f"ASM版本编译失败: {error_msg}"
+
+        run_asm_result = subprocess.run([str(asm_exe_path)], capture_output=True, text=True, timeout=5)
+        if run_asm_result.returncode != 0:
+            error_msg = run_asm_result.stderr.strip() or run_asm_result.stdout.strip() or "ASM 版本未知运行错误"
+            return False, f"ASM版本运行失败: {error_msg}"
+
+        if run_c_result.stdout != run_asm_result.stdout:
+            return False, "C版本与ASM版本测试输出不一致"
+
+        return True, None
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if temp_dir and Path(temp_dir).exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def compile_test(
     func_dep: str,
     func: str,
